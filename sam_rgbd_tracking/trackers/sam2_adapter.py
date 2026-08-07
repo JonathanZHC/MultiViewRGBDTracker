@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+import traceback
 from abc import abstractmethod
 from contextlib import contextmanager, nullcontext
 from typing import Any, ClassVar, Iterator
@@ -28,8 +29,12 @@ class Sam2StyleStreamingTracker(MultiObjectTracker):
     CUDAGraph ordering is preserved:
       lock -> append/preprocess -> propagate -> D2H -> unlock
 
-    The expensive parts that were previously hidden inside ``tracker_total_gpu``
-    are now profiled separately.
+    The adapter also keeps the most recent successful masks. If upstream throws
+    a rare bare ``AssertionError`` during propagation, the current streaming
+    state is considered unsafe to continue using: the state is reset on the
+    current RGB frame and reseeded once from those most recent masks. This
+    prevents a single failed propagation from leaving the streaming history in
+    a permanently inconsistent state.
     """
 
     _predictor_cache: ClassVar[dict[tuple[str, ...], Any]] = {}
@@ -72,6 +77,7 @@ class Sam2StyleStreamingTracker(MultiObjectTracker):
         self.predictor = self._get_or_build_predictor()
         self.stream: StreamingVideoState | None = None
         self.track_ids: list[int] = []
+        self._last_masks_by_track: dict[int, np.ndarray] = {}
 
     @property
     @abstractmethod
@@ -104,7 +110,7 @@ class Sam2StyleStreamingTracker(MultiObjectTracker):
 
     @contextmanager
     def _gpu_guard(self) -> Iterator[None]:
-        """Acquire the shared GPU lock and profile *only* time spent waiting."""
+        """Acquire the shared GPU lock and profile only time spent waiting."""
         if not self.serialize_gpu:
             yield
             return
@@ -206,6 +212,86 @@ class Sam2StyleStreamingTracker(MultiObjectTracker):
             {"backend": self.backend_name},
         )
 
+    def _remember_prediction_masks(self, prediction: TrackerPrediction) -> None:
+        logits = np.asarray(prediction.mask_logits)
+        if logits.ndim == 2:
+            logits = logits[None]
+        for channel, track_id in enumerate(prediction.track_ids):
+            if channel >= logits.shape[0]:
+                continue
+            mask = np.asarray(logits[channel] > 0.0, dtype=bool)
+            if mask.ndim != 2 or not mask.any():
+                continue
+            self._last_masks_by_track[int(track_id)] = mask.copy()
+
+        active = {int(value) for value in self.track_ids}
+        self._last_masks_by_track = {
+            track_id: mask
+            for track_id, mask in self._last_masks_by_track.items()
+            if track_id in active
+        }
+
+    def _recover_after_propagation_assertion(
+        self,
+        frame: RGBDFrame,
+    ) -> TrackerPrediction:
+        """Reset the unsafe state and reseed the current frame once.
+
+        The current frame has already been appended when propagation failed, so
+        simply continuing would leave a hole in EfficientTAM's temporal output
+        dictionaries. Instead, discard that temporal state, make the current RGB
+        frame frame-0, and use the most recent successful masks as prompts.
+        """
+        if self.stream is None:
+            raise RuntimeError("Cannot recover tracker without a streaming state")
+
+        recoverable_ids = [
+            int(track_id)
+            for track_id in self.track_ids
+            if int(track_id) in self._last_masks_by_track
+        ]
+        if not recoverable_ids:
+            raise RuntimeError(
+                "EfficientTAM propagation asserted and no previous masks are "
+                "available for automatic state recovery"
+            )
+
+        with self.profile_stage("tracker_assertion_recovery_gpu", cuda=True):
+            self.stream.reset(frame.rgb)
+            self.track_ids = recoverable_ids
+
+            latest_obj_ids: Any = recoverable_ids
+            latest_logits: Any = np.stack(
+                [
+                    self._last_masks_by_track[track_id].astype(np.float32)
+                    for track_id in recoverable_ids
+                ],
+                axis=0,
+            )
+
+            for track_id in recoverable_ids:
+                output = self.predictor.add_new_mask(
+                    inference_state=self.stream.state,
+                    frame_idx=0,
+                    obj_id=int(track_id),
+                    mask=self._last_masks_by_track[track_id],
+                )
+                if isinstance(output, tuple) and len(output) >= 3:
+                    _, latest_obj_ids, latest_logits = output[-3:]
+
+        with self.profile_stage("tracker_output_d2h_cpu", cuda=False):
+            prediction = self._prediction(latest_obj_ids, latest_logits)
+
+        prediction.metadata.update(
+            {
+                "frame_index": 0,
+                "stream_length": 1,
+                "recovered_from_assertion": True,
+            }
+        )
+        self._remember_prediction_masks(prediction)
+        return prediction
+
     def initialize(
         self,
         frame: RGBDFrame,
@@ -216,10 +302,15 @@ class Sam2StyleStreamingTracker(MultiObjectTracker):
 
         with self._gpu_guard():
             reinit_started = time.perf_counter()
-            with torch.inference_mode(), self._autocast(), tracker_profile_context(self.profiler):
+            with (
+                torch.inference_mode(),
+                self._autocast(),
+                tracker_profile_context(self.profiler),
+            ):
                 with self.profile_stage("tracker_reinit_gpu", cuda=True):
                     self._reset_or_create_stream(frame)
-                    assert self.stream is not None
+                    if self.stream is None:
+                        raise RuntimeError("Tracker stream initialization failed")
                     self.track_ids = [int(seed.track_id) for seed in seeds]
 
                     if not seeds:
@@ -276,6 +367,13 @@ class Sam2StyleStreamingTracker(MultiObjectTracker):
                 ),
                 {"backend": self.backend_name, "keyframe_masks": True},
             )
+
+        self._last_masks_by_track = {
+            int(seed.track_id): np.asarray(seed.mask, dtype=bool).copy()
+            for seed in seeds
+            if np.asarray(seed.mask).ndim == 2 and np.asarray(seed.mask).any()
+        }
+        self._remember_prediction_masks(prediction)
         return prediction
 
     def track(self, frame: RGBDFrame) -> TrackerPrediction:
@@ -294,37 +392,55 @@ class Sam2StyleStreamingTracker(MultiObjectTracker):
 
         call_started = time.perf_counter()
         with self._gpu_guard():
-            with torch.inference_mode(), self._autocast(), tracker_profile_context(self.profiler):
-                # This stage is retained for continuity with old logs, but unlike
-                # the old outer event it starts *after* lock acquisition.
-                with self.profile_stage("tracker_total_gpu", cuda=True):
-                    with self.profile_stage("tracker_append_cpu", cuda=False):
-                        frame_idx = self.stream.append(frame.rgb)
+            with (
+                torch.inference_mode(),
+                self._autocast(),
+                tracker_profile_context(self.profiler),
+            ):
+                try:
+                    with self.profile_stage("tracker_total_gpu", cuda=True):
+                        with self.profile_stage("tracker_append_cpu", cuda=False):
+                            frame_idx = self.stream.append(frame.rgb)
 
-                    with self.profile_stage("tracker_propagate_gpu", cuda=True):
-                        output = None
-                        for output in self.predictor.propagate_in_video(
-                            self.stream.state,
-                            start_frame_idx=frame_idx,
-                            max_frame_num_to_track=1,
-                            reverse=False,
-                        ):
-                            pass
+                        with self.profile_stage("tracker_propagate_gpu", cuda=True):
+                            output = None
+                            for output in self.predictor.propagate_in_video(
+                                self.stream.state,
+                                start_frame_idx=frame_idx,
+                                max_frame_num_to_track=1,
+                                reverse=False,
+                            ):
+                                pass
 
-                if output is None:
-                    raise RuntimeError(
-                        f"{self.backend_name} returned no output for frame {frame_idx}"
+                    if output is None:
+                        raise RuntimeError(
+                            f"{self.backend_name} returned no output for frame {frame_idx}"
+                        )
+
+                    out_frame_idx, obj_ids, logits = output[:3]
+                    with self.profile_stage("tracker_output_d2h_cpu", cuda=False):
+                        prediction = self._prediction(obj_ids, logits)
+                    prediction.metadata.update(
+                        {
+                            "frame_index": int(out_frame_idx),
+                            "stream_length": int(self.stream.state["num_frames"]),
+                        }
                     )
+                    self._remember_prediction_masks(prediction)
 
-                out_frame_idx, obj_ids, logits = output[:3]
-                with self.profile_stage("tracker_output_d2h_cpu", cuda=False):
-                    prediction = self._prediction(obj_ids, logits)
-                prediction.metadata.update(
-                    {
-                        "frame_index": int(out_frame_idx),
-                        "stream_length": int(self.stream.state["num_frames"]),
-                    }
-                )
+                except AssertionError:
+                    # Do not continue using a state in which append succeeded but
+                    # propagation aborted midway. Print the original upstream
+                    # traceback once, then rebuild the current frame from the most
+                    # recent successful masks.
+                    print(
+                        "[EfficientTAM] AssertionError during propagation; "
+                        "resetting the current streaming state and reseeding from "
+                        "the last successful masks. Original traceback:\n"
+                        + traceback.format_exc(),
+                        flush=True,
+                    )
+                    prediction = self._recover_after_propagation_assertion(frame)
 
         self.record_profile(
             "tracker_total_wall_cpu",
@@ -336,3 +452,4 @@ class Sam2StyleStreamingTracker(MultiObjectTracker):
         if self.stream is not None:
             self.stream.close()
             self.stream = None
+        self._last_masks_by_track.clear()

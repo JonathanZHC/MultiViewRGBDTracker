@@ -54,16 +54,13 @@ class TrackerPrediction:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass
-class DepthModel:
-    median_m: float
-    mad_m: float
-
-
 class VisibilityState(str, Enum):
+    """Tracking-level state only.
+
+    Depth-based partial/occluded classification was intentionally removed.
+    """
+
     VISIBLE = "visible"
-    PARTIAL = "partial"
-    OCCLUDED = "occluded"
     LOST = "lost"
 
 
@@ -75,11 +72,9 @@ class TrackState:
     embedding: np.ndarray | None = None
     last_mask: np.ndarray | None = None
     last_raw_mask: np.ndarray | None = None
-    depth_model: DepthModel | None = None
     centroid_camera: np.ndarray | None = None
     centroid_world: np.ndarray | None = None
     tracking_confidence: float = 1.0
-    visible_ratio: float = 1.0
     missing_frames: int = 0
     last_seen_frame: int = 0
 
@@ -100,8 +95,6 @@ class ProcessedInstance:
     centroid_world: np.ndarray | None
     bbox_min: np.ndarray | None
     bbox_max: np.ndarray | None
-    visible_ratio: float
-    depth_consistency: float
     status: VisibilityState
 
 

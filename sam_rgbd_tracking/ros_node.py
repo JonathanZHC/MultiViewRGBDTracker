@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import traceback
+
 import argparse
 import queue
 import threading
@@ -195,7 +197,8 @@ class _CameraWorker:
             except Exception as error:
                 self.node.get_logger().error(
                     f"{self.camera_name}: "
-                    f"{type(error).__name__}: {error}"
+                    f"{type(error).__name__}: {error}\n"
+                    f"{traceback.format_exc()}"
                 )
 
     def close(self) -> None:
