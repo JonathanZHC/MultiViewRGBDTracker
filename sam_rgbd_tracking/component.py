@@ -74,9 +74,14 @@ class SAMTrackingComponent:
             config = Config(data)
         self.config = config
         self.camera_name = camera_name
+        self.profiler = FrameProfiler(
+            config,
+            name=f"{camera_name}/{config.tracker.backend}",
+        )
         self.detector = detector or build_detector(config)
         self.tracker = tracker or build_tracker(config)
-        self.profiler = FrameProfiler(config, name=f"{camera_name}/{config.tracker.backend}")
+        if hasattr(self.tracker, "set_profiler"):
+            self.tracker.set_profiler(self.profiler)
         self.tracks: dict[int, TrackState] = {}
         self.next_track_id = 1
         self.frame_index = 0
@@ -127,7 +132,10 @@ class SAMTrackingComponent:
             trigger_reasons.append("initial" if not self.tracks else "periodic")
             prediction = self._run_keyframe(frame)
         else:
-            with self.profiler.stage("tracker_total_gpu", cuda=True):
+            # Wall-clock call duration is kept separate from internal tracker
+            # stages. In particular, lock waiting is no longer mislabeled as
+            # EfficientTAM GPU inference.
+            with self.profiler.stage("tracker_call_wall_cpu", cuda=False):
                 prediction = self.tracker.track(frame)
             self._update_raw_observations(prediction)
             if self._anomaly_keyframe(frame.frame_index, prediction):
@@ -170,7 +178,7 @@ class SAMTrackingComponent:
             detections = self.detector.detect(frame)
         seeds = self._associate_and_seed(frame, detections)
         self._bootstrap_depth_models(frame, seeds)
-        with self.profiler.stage("tracker_total_gpu", cuda=True):
+        with self.profiler.stage("tracker_call_wall_cpu", cuda=False):
             prediction = self.tracker.correct(frame, seeds)
         self.last_keyframe = frame.frame_index
         return prediction

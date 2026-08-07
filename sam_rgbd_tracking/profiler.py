@@ -16,12 +16,36 @@ except ImportError:  # pragma: no cover
 
 
 class FrameProfiler:
-    """Low-overhead cycle profiler.
+    """Per-frame CPU/CUDA profiler with one synchronization at frame end.
 
-    GPU stages use CUDA events and are synchronized once at frame end. The
-    printed names intentionally stay stable because they are convenient for
-    comparing SAM3, tracker, CPU postprocess and end-to-end cycle time.
+    The tracker now exposes its internal stages instead of treating the whole
+    tracker call as one opaque CUDA interval. This is important with two camera
+    workers because lock waiting and CPU preprocessing must not be mistaken for
+    EfficientTAM inference time.
     """
+
+    PREFERRED_ORDER = [
+        "pipeline_total",
+        "postprocess_cpu",
+        "sam3_total_gpu",
+        "tracker_call_wall_cpu",
+        "tracker_total_wall_cpu",
+        "tracker_lock_wait_cpu",
+        "tracker_first_init_cpu",
+        "tracker_reinit_wall_cpu",
+        "tracker_reinit_gpu",
+        "tracker_stream_reset_cpu",
+        "tracker_seed_gpu",
+        "tracker_append_cpu",
+        "tracker_input_host_copy_cpu",
+        "tracker_input_preprocess_gpu",
+        "tracker_buffer_grow_gpu",
+        "tracker_buffer_grow_cpu",
+        "tracker_propagate_gpu",
+        "tracker_state_clone_gpu",
+        "tracker_output_d2h_cpu",
+        "tracker_total_gpu",
+    ]
 
     def __init__(self, config, name: str = "tracking") -> None:
         self.name = name
@@ -32,7 +56,10 @@ class FrameProfiler:
         self.csv_path = Path(raw_csv) if raw_csv else None
         if self.csv_path is not None and name != "tracking":
             safe = name.replace("/", "_").replace(" ", "_")
-            self.csv_path = self.csv_path.with_name(f"{self.csv_path.stem}_{safe}{self.csv_path.suffix}")
+            self.csv_path = self.csv_path.with_name(
+                f"{self.csv_path.stem}_{safe}{self.csv_path.suffix}"
+            )
+
         self._history: dict[str, list[float]] = {}
         self._history_frames: dict[str, list[int]] = {}
         self._current_cpu: dict[str, float] = {}
@@ -49,11 +76,18 @@ class FrameProfiler:
         self._current_cpu = {}
         self._current_cuda = {}
 
+    def record(self, name: str, value_ms: float) -> None:
+        """Add an already measured CPU/wall-clock duration to this frame."""
+        if not self.enabled:
+            return
+        self._current_cpu[name] = self._current_cpu.get(name, 0.0) + float(value_ms)
+
     @contextmanager
     def stage(self, name: str, *, cuda: bool = False) -> Iterator[None]:
         if not self.enabled:
             yield
             return
+
         can_cuda = (
             cuda
             and self.use_cuda_events
@@ -75,21 +109,28 @@ class FrameProfiler:
                 yield
             finally:
                 elapsed = 1000.0 * (time.perf_counter() - start_t)
-                self._current_cpu[name] = self._current_cpu.get(name, 0.0) + elapsed
+                self.record(name, elapsed)
 
     def end_frame(self) -> dict[str, float]:
         if not self.enabled:
             return {}
+
         timings = dict(self._current_cpu)
         if self._current_cuda:
-            # Synchronize only at frame end; repeated stages in the same frame are
-            # accumulated (e.g. normal tracking followed by anomaly correction).
+            # One synchronization point per frame. Repeated stage names are
+            # accumulated, e.g. memory_attention can run more than once.
             for pairs in self._current_cuda.values():
                 for _, end in pairs:
                     end.synchronize()
             for name, pairs in self._current_cuda.items():
-                timings[name] = sum(float(start.elapsed_time(end)) for start, end in pairs)
-        timings["pipeline_total"] = 1000.0 * (time.perf_counter() - self._frame_start)
+                timings[name] = sum(
+                    float(start.elapsed_time(end)) for start, end in pairs
+                )
+
+        timings["pipeline_total"] = 1000.0 * (
+            time.perf_counter() - self._frame_start
+        )
+
         with self._lock:
             self._frames += 1
             for key, value in timings.items():
@@ -108,23 +149,22 @@ class FrameProfiler:
             return
         path.parent.mkdir(parents=True, exist_ok=True)
         exists = path.exists()
-        fields = [
-            "frame",
-            "pipeline_total",
-            "postprocess_cpu",
-            "sam3_total_gpu",
-            "tracker_total_gpu",
-        ]
+        fields = ["frame", *self.PREFERRED_ORDER]
+        # Keep any future/new stages instead of silently dropping them.
+        fields.extend(sorted(k for k in timings if k not in fields))
         try:
             with path.open("a", newline="", encoding="utf-8") as handle:
-                writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=fields,
+                    extrasaction="ignore",
+                )
                 if not exists:
                     writer.writeheader()
-                row = {"frame": frame_number, **timings}
-                writer.writerow(row)
-        except OSError:
-            # Profiling must never stop the real-time path because a mounted log
-            # directory is read-only. Console statistics remain available.
+                writer.writerow({"frame": frame_number, **timings})
+        except (OSError, ValueError):
+            # A mounted log folder can be read-only, and an existing CSV may
+            # have an older header. Profiling must never stop the real-time path.
             self.csv_path = None
 
     @staticmethod
@@ -143,8 +183,9 @@ class FrameProfiler:
         if not self.enabled:
             return
         print(f"[Profiler:{self.name}] frames={self._frames}", flush=True)
-        preferred = ["pipeline_total", "postprocess_cpu", "sam3_total_gpu", "tracker_total_gpu"]
-        keys = preferred + sorted(k for k in self._history if k not in preferred)
+        keys = self.PREFERRED_ORDER + sorted(
+            key for key in self._history if key not in self.PREFERRED_ORDER
+        )
         for key in keys:
             values = self._history.get(key)
             if not values:

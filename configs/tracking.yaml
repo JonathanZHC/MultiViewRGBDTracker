@@ -65,7 +65,7 @@ association:
 
 postprocess:
   mask_threshold: 0.0
-  overlap_depth_only: true
+  overlap_depth_only: False
   depth_model_min_pixels: 40
   depth_gate_mad_scale: 4.0
   depth_gate_min_m: 0.035
