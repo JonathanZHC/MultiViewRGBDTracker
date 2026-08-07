@@ -1,16 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONTAINER="${CONTAINER:-sam-rgbd-tracking}"
+CONFIG="${1:-/workspace/rviz/tracking.rviz}"
 
-if [[ ! -f /.dockerenv ]]; then
-    exec "${SCRIPT_DIR}/run_in_container.sh" ./scripts/run_rviz.sh "$@"
-fi
+"${REPO_ROOT}/scripts/launch.sh"
 
-# shellcheck source=scripts/ros_env.sh
-source "${SCRIPT_DIR}/ros_env.sh"
-cd "${REPO_ROOT}"
+docker exec -it "${CONTAINER}" bash -lc "
+  export __GLX_VENDOR_LIBRARY_NAME=nvidia
+  export __NV_PRIME_RENDER_OFFLOAD=1
+  export QT_X11_NO_MITSHM=1
 
-RVIZ_CONFIG="${1:-rviz/tracking_benchmark.rviz}"
-exec rviz2 -d "${RVIZ_CONFIG}"
+  export XDG_RUNTIME_DIR=/tmp/runtime-1234
+  export XDG_CACHE_HOME=/tmp/rviz-cache
+
+  mkdir -p \"\${XDG_RUNTIME_DIR}\" \"\${XDG_CACHE_HOME}\"
+  chmod 700 \"\${XDG_RUNTIME_DIR}\" 2>/dev/null || true
+
+  source /opt/ros/jazzy/setup.bash
+
+  exec rviz2 -d '${CONFIG}'
+"

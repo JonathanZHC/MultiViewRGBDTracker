@@ -1,38 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONTAINER="${CONTAINER:-sam-rgbd-tracking}"
+BACKEND="${1:-sam_mt}"
+if [[ $# -gt 0 ]]; then shift; fi
 
-if [[ ! -f /.dockerenv ]]; then
-    exec "${SCRIPT_DIR}/run_in_container.sh" ./scripts/run_tracking.sh "$@"
-fi
-
-# shellcheck source=scripts/ros_env.sh
-source "${SCRIPT_DIR}/ros_env.sh"
-cd "${REPO_ROOT}"
-
-TRACKER="${1:-sam_mt}"
-[[ $# -gt 0 ]] && shift
-
-case "${TRACKER}" in
-    mock|sam_mt|efficient_tam) ;;
-    *)
-        echo "Unknown tracker '${TRACKER}'. Expected mock, sam_mt, or efficient_tam." >&2
-        exit 2
-        ;;
+case "${BACKEND}" in
+  sam_mt|efficient_tam) ;;
+  *) echo "usage: $0 [sam_mt|efficient_tam] [extra ros_node args...]" >&2; exit 2 ;;
 esac
 
-if [[ -n "${DETECTOR:-}" ]]; then
-    detector="${DETECTOR}"
-elif [[ "${TRACKER}" == "mock" ]]; then
-    detector="ground_truth"
-else
-    detector="sam3"
-fi
+"${REPO_ROOT}/scripts/launch.sh"
 
-exec python -m sam_rgbd_tracking_benchmark.node \
-    --config configs/benchmark.yaml \
-    --tracker "${TRACKER}" \
-    --detector "${detector}" \
-    "$@"
+docker exec -it "${CONTAINER}" bash -lc "
+  source /opt/ros/jazzy/setup.bash
+  cd /workspace
+  exec /opt/tracking-venv/bin/python -m sam_rgbd_tracking.ros_node \\
+    --config /workspace/configs/tracking.yaml \\
+    --tracker '${BACKEND}' \\
+    $*
+"

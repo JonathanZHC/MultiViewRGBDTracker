@@ -1,15 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "${REPO_ROOT}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+IMAGE_NAME="${IMAGE_NAME:-sam-rgbd-tracking:latest}"
+DOCKERFILE="${REPO_ROOT}/Dockerfile"
 
-IMAGE_NAME="${IMAGE_NAME:-sam-rgbd-tracking-benchmark:latest}"
+if [[ ! -f "${DOCKERFILE}" ]]; then
+    echo "[ERROR] Dockerfile not found: ${DOCKERFILE}" >&2
+    exit 1
+fi
 
-exec docker build \
-    --build-arg SAM3_REF="${SAM3_REF:-main}" \
-    --build-arg SAM_MT_REF="${SAM_MT_REF:-main}" \
-    --build-arg EFFICIENT_TAM_REF="${EFFICIENT_TAM_REF:-main}" \
-    --tag "${IMAGE_NAME}" \
-    "$@" \
-    .
+echo "[BUILD] ${IMAGE_NAME}"
+echo "        dockerfile: ${DOCKERFILE}"
+echo "        context:    ${REPO_ROOT}"
+
+docker build \
+    --progress=plain \
+    -f "${DOCKERFILE}" \
+    -t "${IMAGE_NAME}" \
+    "${REPO_ROOT}"
