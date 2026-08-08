@@ -15,6 +15,9 @@ docker exec -it "${CONTAINER}" bash -lc "
   export XDG_RUNTIME_DIR=/tmp/runtime-1234
   export XDG_CACHE_HOME=/tmp/rviz-cache
 
+  export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+  export FASTDDS_BUILTIN_TRANSPORTS='LARGE_DATA?max_msg_size=4MB&sockets_size=8MB&non_blocking=true&tcp_negotiation_timeout=50'
+
   mkdir -p \"\${XDG_RUNTIME_DIR}\" \"\${XDG_CACHE_HOME}\"
   chmod 700 \"\${XDG_RUNTIME_DIR}\" 2>/dev/null || true
 

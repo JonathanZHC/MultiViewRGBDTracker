@@ -42,10 +42,26 @@ def build_tracker(config):
 
     if backend == "efficient_tam":
         cfg = config.tracker.efficient_tam
+
+        # By default warm every object-count specialization up to the number of
+        # configured text prompts. This keeps the one-prompt benchmark cheap
+        # while automatically covering 1..N for the usual multi-prompt setup.
+        prompts = list(config.detector.get("prompts", []))
+        default_max_objects = max(1, len(prompts))
+        default_object_counts = list(range(1, default_max_objects + 1))
+        configured_counts = cfg.get("prewarm_object_counts", default_object_counts)
+        if isinstance(configured_counts, (int, float)):
+            configured_counts = [int(configured_counts)]
+
         return EfficientTAMTracker(
             config_path=str(cfg.config),
             checkpoint_path=str(cfg.checkpoint),
             non_overlap_masks=bool(cfg.non_overlap_masks),
+            prewarm_enabled=bool(cfg.get("prewarm_enabled", True)),
+            prewarm_object_counts=[int(v) for v in configured_counts],
+            prewarm_temporal_frames=int(cfg.get("prewarm_temporal_frames", 0)),
+            prewarm_post_reset_frames=int(cfg.get("prewarm_post_reset_frames", 2)),
+            prewarm_passes=int(cfg.get("prewarm_passes", 2)),
             **common,
         )
 

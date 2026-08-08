@@ -15,6 +15,10 @@ esac
 
 docker exec -it "${CONTAINER}" bash -lc "
   source /opt/ros/jazzy/setup.bash
+
+  export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+  export FASTDDS_BUILTIN_TRANSPORTS='LARGE_DATA?max_msg_size=4MB&sockets_size=8MB&non_blocking=true&tcp_negotiation_timeout=50'
+
   cd /workspace
   exec /opt/tracking-venv/bin/python -m sam_rgbd_tracking.ros_node \\
     --config /workspace/configs/tracking.yaml \\

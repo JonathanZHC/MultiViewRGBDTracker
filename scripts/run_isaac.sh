@@ -11,10 +11,15 @@ case "${SCENE}" in
   *) echo "usage: $0 [static|dynamic|hybrid] [extra run_isaacsim.py args...]" >&2; exit 2 ;;
 esac
 
+
 "${REPO_ROOT}/scripts/launch.sh"
 
 docker exec -it "${CONTAINER}" bash -lc "
   source /opt/ros/jazzy/setup.bash
+
+  export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+  export FASTDDS_BUILTIN_TRANSPORTS='LARGE_DATA?max_msg_size=4MB&sockets_size=8MB&non_blocking=true&tcp_negotiation_timeout=50'
+  
   exec /isaac-sim/python.sh /workspace/isaacscene/run_isaacsim.py \\
     --scene '${SCENE}' \\
     --width 640 \\

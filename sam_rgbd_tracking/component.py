@@ -126,6 +126,13 @@ class SAMTrackingComponent:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
 
+    def prewarm_tracker(self, first_rgb: np.ndarray) -> dict:
+        """Pre-warm backend-specific compiled tracker paths without changing live state."""
+        prewarm = getattr(self.tracker, "prewarm", None)
+        if not callable(prewarm):
+            return {"enabled": False, "performed": False}
+        return dict(prewarm(np.ascontiguousarray(first_rgb, dtype=np.uint8)))
+
     def process_arrays(
         self,
         rgb: np.ndarray,

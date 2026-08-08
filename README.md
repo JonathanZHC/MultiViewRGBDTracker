@@ -32,6 +32,41 @@ There is deliberately **no `src/` directory and no `pyproject.toml`**. The repos
 └── README.md
 ```
 
+## 0. Preparation on Host
+
+Lunch the following command on the 'host':
+
+```bash
+sudo tee /etc/sysctl.d/99-fastdds-large-data.conf >/dev/null <<'EOF'
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+
+net.ipv4.tcp_rmem=4096 4194304 16777216
+net.ipv4.tcp_wmem=4096 4194304 16777216
+EOF
+
+sudo sysctl --system
+```
+
+Check:
+
+```bash
+sysctl net.core.rmem_max
+sysctl net.core.wmem_max
+sysctl net.ipv4.tcp_rmem
+sysctl net.ipv4.tcp_wmem
+```
+
+This should output:
+
+```text
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096	4194304	16777216
+net.ipv4.tcp_wmem = 4096	4194304	16777216
+```
+
+
 ## 1. Build
 
 From the repository root:
