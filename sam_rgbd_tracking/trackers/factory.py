@@ -37,6 +37,12 @@ def build_tracker(config):
             checkpoint_path=str(cfg.checkpoint),
             non_overlap_masks=bool(cfg.non_overlap_masks),
             points_per_object=int(cfg.points_per_object),
+            # SAM-MT stays on its native multi-target predictor; only the SAM2
+            # image encoder is compiled. Defaults are enabled so existing
+            # tracking.yaml files do not need to change.
+            compile_image_encoder=bool(cfg.get("compile_image_encoder", True)),
+            prewarm_enabled=bool(cfg.get("prewarm_enabled", True)),
+            prewarm_passes=int(cfg.get("prewarm_passes", 2)),
             **common,
         )
 

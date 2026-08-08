@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import threading
 import time
-from typing import Any
+from typing import Any, ClassVar
 
 import cv2
 import numpy as np
@@ -9,6 +10,7 @@ import numpy as np
 from ..data_types import RGBDFrame, TrackerPrediction, TrackerSeed
 from .base import tracker_profile_context
 from .sam2_adapter import Sam2StyleStreamingTracker
+from .streaming_state import StreamingVideoState
 
 try:
     import torch
@@ -17,19 +19,58 @@ except ImportError:  # pragma: no cover
 
 
 class SamMTTracker(Sam2StyleStreamingTracker):
-    """SAM-MT adapter using the same optimized streaming state infrastructure."""
+    """SAM-MT adapter using the same optimized streaming state infrastructure.
 
-    def __init__(self, *args, points_per_object: int = 2, **kwargs) -> None:
+    SAM-MT keeps its native multi-target propagation path (``vos_optimized=False``)
+    and optionally compiles *only* the SAM2 image encoder. This is intentionally
+    narrower than full VOS compilation: the SAM-MT-specific multi-target logic,
+    memory attention, decoder, and memory encoder stay eager.
+
+    The image encoder compile is enabled by default because it is the lowest-risk
+    upstream-supported compile option for this backend. The first compile is
+    pre-warmed on the same persistent GPU-owner OS thread used by live inference,
+    so the expensive first ``torch.compile`` call does not land in a live cycle.
+    """
+
+    _image_encoder_prewarm_lock: ClassVar[threading.Lock] = threading.Lock()
+    _image_encoder_prewarm_done: ClassVar[set[tuple[Any, ...]]] = set()
+
+    def __init__(
+        self,
+        *args,
+        points_per_object: int = 2,
+        compile_image_encoder: bool = True,
+        prewarm_enabled: bool = True,
+        prewarm_passes: int = 2,
+        **kwargs,
+    ) -> None:
         self.num_points_per_object = max(1, int(points_per_object))
         self.points_per_object: list[int] = []
+        self.compile_image_encoder = bool(compile_image_encoder)
+        self.prewarm_enabled = bool(prewarm_enabled)
+        self.prewarm_passes = max(1, int(prewarm_passes))
         super().__init__(*args, **kwargs)
 
     @property
     def backend_name(self) -> str:
         return "sam_mt"
 
+    def _cache_key(self) -> tuple[str, ...]:
+        # The base predictor cache is shared between camera components. Include
+        # the image-encoder compile mode so an eager and compiled SAM-MT
+        # predictor can never alias the same cached model instance.
+        return super()._cache_key() + (str(self.compile_image_encoder),)
+
     def _build_predictor(self) -> Any:
         from sam2.build_sam import build_sam2_video_predictor
+
+        overrides = [
+            f"++model.non_overlap_masks={str(self.non_overlap_masks).lower()}",
+            (
+                "++model.compile_image_encoder="
+                f"{str(self.compile_image_encoder).lower()}"
+            ),
+        ]
 
         return build_sam2_video_predictor(
             config_file=self.config_path,
@@ -37,11 +78,125 @@ class SamMTTracker(Sam2StyleStreamingTracker):
             device=self.device,
             mode="eval",
             apply_postprocessing=False,
-            hydra_overrides_extra=[
-                f"++model.non_overlap_masks={str(self.non_overlap_masks).lower()}"
-            ],
+            hydra_overrides_extra=overrides,
+            # Keep SAM-MT's native multi-target predictor path. Only the image
+            # encoder is compiled through SAM2Base.compile_image_encoder.
             vos_optimized=False,
         )
+
+    def _prewarm_key(self, height: int, width: int) -> tuple[Any, ...]:
+        device_index = -1
+        if torch is not None and str(self.device).startswith("cuda"):
+            device_index = torch.device(self.device).index
+            if device_index is None:
+                device_index = torch.cuda.current_device()
+        return (
+            id(self.predictor),
+            int(height),
+            int(width),
+            int(getattr(self.predictor, "image_size", 0)),
+            str(self.device),
+            int(device_index),
+            bool(self.use_bf16),
+        )
+
+    def prewarm(self, first_rgb: np.ndarray) -> dict[str, Any]:
+        """Compile/capture only the SAM-MT image encoder before live tracking.
+
+        A temporary streaming state is used only to obtain the exact normalized
+        image tensor shape used by the real pipeline. We then call
+        ``predictor.forward_image`` directly so the warm-up does not create any
+        SAM-MT prompts, objects, or temporal memory and cannot change live state.
+
+        The ROS node already routes this method through the single persistent
+        GPU-owner thread. Keeping compile and live replay on that same OS thread
+        avoids PyTorch Inductor CUDAGraph-tree TLS problems.
+        """
+        if not self.compile_image_encoder or not self.prewarm_enabled:
+            return {
+                "enabled": bool(self.compile_image_encoder),
+                "performed": False,
+                "reason": "disabled",
+            }
+        if torch is None:
+            return {"enabled": True, "performed": False, "reason": "no_torch"}
+
+        rgb = np.ascontiguousarray(first_rgb, dtype=np.uint8)
+        height, width = rgb.shape[:2]
+        key = self._prewarm_key(height, width)
+
+        with self._image_encoder_prewarm_lock:
+            if key in self._image_encoder_prewarm_done:
+                return {
+                    "enabled": True,
+                    "performed": False,
+                    "reason": "already_warm",
+                }
+
+            started = time.perf_counter()
+            pass_ms: list[float] = []
+            stream: StreamingVideoState | None = None
+
+            try:
+                with self._gpu_guard():
+                    # Use the exact same preprocessing/state path as live
+                    # tracking, but never seed or propagate the temporary state.
+                    stream = StreamingVideoState(
+                        self.predictor,
+                        rgb,
+                        self.offload_video_to_cpu,
+                        self.offload_state_to_cpu,
+                        buffer_frames=2,
+                        profiler=None,
+                        use_gpu_preprocess=self.gpu_preprocess,
+                        pin_input_memory=self.pin_input_memory,
+                    )
+
+                    image = stream.state["images"][0:1].to(
+                        torch.device(self.device),
+                        dtype=torch.float32,
+                        non_blocking=True,
+                    )
+
+                    with torch.inference_mode(), self._autocast():
+                        for pass_index in range(self.prewarm_passes):
+                            pass_started = time.perf_counter()
+                            backbone_out = self.predictor.forward_image(image)
+                            if str(self.device).startswith("cuda"):
+                                torch.cuda.synchronize(torch.device(self.device))
+                            elapsed_ms = 1000.0 * (
+                                time.perf_counter() - pass_started
+                            )
+                            pass_ms.append(elapsed_ms)
+
+                            # Do not retain CUDAGraph-backed outputs across the
+                            # next replay. Live code will immediately consume its
+                            # backbone output inside _get_image_feature.
+                            del backbone_out
+
+                            print(
+                                "[SAM-MT image-encoder warmup] "
+                                f"pass={pass_index + 1}/{self.prewarm_passes} "
+                                f"wall={elapsed_ms:.1f} ms",
+                                flush=True,
+                            )
+
+                self._image_encoder_prewarm_done.add(key)
+                total_ms = 1000.0 * (time.perf_counter() - started)
+                print(
+                    "[SAM-MT image-encoder warmup] complete "
+                    f"total={total_ms:.1f} ms",
+                    flush=True,
+                )
+                return {
+                    "enabled": True,
+                    "performed": True,
+                    "passes_ms": pass_ms,
+                    "total_ms": total_ms,
+                }
+            finally:
+                if stream is not None:
+                    stream.close()
 
     def _interior_points(self, mask: np.ndarray) -> np.ndarray:
         binary = np.asarray(mask, dtype=np.uint8)

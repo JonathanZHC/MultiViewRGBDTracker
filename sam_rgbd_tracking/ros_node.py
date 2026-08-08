@@ -579,10 +579,17 @@ class _CameraWorker:
         )
         self.visualizer = RvizPublisher(node, camera_name, config)
         self.diagnostics = _RateDiagnostics(node, camera_name, config)
-        self._prewarm_pending = bool(
-            str(config.tracker.backend) == "efficient_tam"
+        backend = str(config.tracker.backend)
+        efficient_tam_prewarm = bool(
+            backend == "efficient_tam"
             and bool(config.tracker.efficient_tam.get("prewarm_enabled", True))
         )
+        sam_mt_prewarm = bool(
+            backend == "sam_mt"
+            and bool(config.tracker.sam_mt.get("compile_image_encoder", True))
+            and bool(config.tracker.sam_mt.get("prewarm_enabled", True))
+        )
+        self._prewarm_pending = efficient_tam_prewarm or sam_mt_prewarm
         self.queue: queue.Queue[_Packet] = queue.Queue(
             maxsize=int(config.runtime.queue_size)
         )
@@ -777,8 +784,14 @@ class _CameraWorker:
                 )
 
                 if self._prewarm_pending:
+                    backend = str(self.config.tracker.backend)
+                    warmup_label = (
+                        "EfficientTAM full pre-warm"
+                        if backend == "efficient_tam"
+                        else "SAM-MT image-encoder compile pre-warm"
+                    )
                     self.node.get_logger().info(
-                        f"{self.camera_name}: starting EfficientTAM full pre-warm; "
+                        f"{self.camera_name}: starting {warmup_label}; "
                         "camera/rate diagnostics will reset when it completes"
                     )
                     warmup_result = _run_on_gpu_owner(
@@ -797,7 +810,8 @@ class _CameraWorker:
                             break
                     self.diagnostics.reset_all()
                     self.node.get_logger().info(
-                        f"{self.camera_name}: EfficientTAM pre-warm complete "
+                        f"{self.camera_name}: tracker pre-warm complete "
+                        f"backend={backend} "
                         f"performed={warmup_result.get('performed', False)}; "
                         "live diagnostics restarted from zero"
                     )
