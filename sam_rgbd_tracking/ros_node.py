@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import queue
 import threading
 import time
@@ -13,6 +14,23 @@ import numpy as np
 from .component import SAMTrackingComponent
 from .config import load_config
 from .visualization import RvizPublisher
+
+
+# torch.compile + Inductor CUDAGraph Trees keep capture-manager state in
+# thread-local storage. EfficientTAM uses a predictor shared by both cameras, so
+# all model construction, pre-warm, keyframe correction, and propagation must
+# execute on one persistent OS thread. A mutex alone is insufficient: it
+# serializes CUDA work but still alternates between the two camera worker
+# threads, which can make deferred CUDAGraph capture fail in PyTorch TLS.
+_GPU_OWNER_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="sam-gpu-owner",
+)
+
+
+def _run_on_gpu_owner(function, /, *args, **kwargs):
+    """Run model-owning work on the single persistent CUDAGraph thread."""
+    return _GPU_OWNER_EXECUTOR.submit(function, *args, **kwargs).result()
 
 
 @dataclass
@@ -554,7 +572,11 @@ class _CameraWorker:
         self.camera_name = camera_name
         self.config = config
         self.bridge = CvBridge()
-        self.component = SAMTrackingComponent(config, camera_name=camera_name)
+        self.component = _run_on_gpu_owner(
+            SAMTrackingComponent,
+            config,
+            camera_name=camera_name,
+        )
         self.visualizer = RvizPublisher(node, camera_name, config)
         self.diagnostics = _RateDiagnostics(node, camera_name, config)
         self._prewarm_pending = bool(
@@ -759,7 +781,10 @@ class _CameraWorker:
                         f"{self.camera_name}: starting EfficientTAM full pre-warm; "
                         "camera/rate diagnostics will reset when it completes"
                     )
-                    warmup_result = self.component.prewarm_tracker(rgb)
+                    warmup_result = _run_on_gpu_owner(
+                        self.component.prewarm_tracker,
+                        rgb,
+                    )
                     self._prewarm_pending = False
 
                     # Frames accumulated while compilation/capture was running are
@@ -799,7 +824,8 @@ class _CameraWorker:
                 )
 
                 stage_start = time.perf_counter()
-                result = self.component.process_arrays(
+                result = _run_on_gpu_owner(
+                    self.component.process_arrays,
                     rgb,
                     depth_m,
                     fx=float(intrinsics[0]),
@@ -852,8 +878,8 @@ class _CameraWorker:
             force=True,
             queue_depth=self.queue.qsize(),
         )
-        self.component.print_stats()
-        self.component.close()
+        _run_on_gpu_owner(self.component.print_stats)
+        _run_on_gpu_owner(self.component.close)
 
 
 class _CameraOnlyWorker:
