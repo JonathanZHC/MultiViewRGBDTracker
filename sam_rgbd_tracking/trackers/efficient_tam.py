@@ -12,6 +12,7 @@ try:
 except ImportError:  # pragma: no cover
     torch = None
 
+from ..data_types import TrackerPrediction, TrackerSeed
 from .base import GLOBAL_CUDA_LOCK, current_tracker_profiler
 from .sam2_adapter import Sam2StyleStreamingTracker
 from .streaming_state import StreamingVideoState
@@ -155,8 +156,19 @@ class EfficientTAMTracker(Sam2StyleStreamingTracker):
         prewarm_temporal_frames: int = 0,
         prewarm_post_reset_frames: int = 2,
         prewarm_passes: int = 2,
+        execution_mode: str = "sequential",
+        fixed_num_views: int = 2,
+        max_objects_per_view: int = 4,
         **kwargs: Any,
     ) -> None:
+        self.execution_mode = str(execution_mode).strip().lower()
+        if self.execution_mode not in {"sequential", "fixed_batch"}:
+            raise ValueError(
+                f"Unsupported EfficientTAM execution_mode={self.execution_mode!r}; "
+                "use 'sequential' or 'fixed_batch'."
+            )
+        self.fixed_num_views = max(1, int(fixed_num_views))
+        self.max_objects_per_view = max(1, int(max_objects_per_view))
         self.prewarm_enabled = bool(prewarm_enabled)
         cleaned = sorted({max(1, int(value)) for value in prewarm_object_counts})
         self.prewarm_object_counts = tuple(cleaned or [1])
@@ -168,6 +180,13 @@ class EfficientTAMTracker(Sam2StyleStreamingTracker):
     @property
     def backend_name(self) -> str:
         return "efficient_tam"
+
+    def _cache_key(self) -> tuple[str, ...]:
+        return super()._cache_key() + (
+            self.execution_mode,
+            str(self.fixed_num_views),
+            str(self.max_objects_per_view),
+        )
 
     def _build_predictor(self) -> Any:
         from efficient_track_anything.build_efficienttam import (
@@ -181,6 +200,9 @@ class EfficientTAMTracker(Sam2StyleStreamingTracker):
             mode="eval",
             apply_postprocessing=True,
             vos_optimized=self.vos_optimized,
+            execution_mode=self.execution_mode,
+            fixed_num_views=self.fixed_num_views,
+            max_objects_per_view=self.max_objects_per_view,
         )
 
         _move_rope_frequency_caches_to_device(predictor, self.device)
@@ -354,7 +376,7 @@ class EfficientTAMTracker(Sam2StyleStreamingTracker):
                 }
 
             print(
-                "[EfficientTAM warmup] starting full VOS pre-warm: "
+                "[stage] EfficientTAM single-view pre-warm: "
                 f"resolution={rgb.shape[1]}x{rgb.shape[0]}, "
                 f"objects={list(self.prewarm_object_counts)}, "
                 f"temporal_frames={temporal_frames}, "
@@ -382,18 +404,6 @@ class EfficientTAMTracker(Sam2StyleStreamingTracker):
                             )
                             results.append(result)
 
-                            prop = result["propagation_ms"]
-                            reset_prop = result["reset_propagation_ms"]
-                            prop_max = max(prop) if prop else 0.0
-                            reset_max = max(reset_prop) if reset_prop else 0.0
-                            print(
-                                "[EfficientTAM warmup] "
-                                f"pass={pass_index + 1}/{self.prewarm_passes} "
-                                f"objects={object_count}: wall={result['wall_ms']:.1f} ms, "
-                                f"prop_max={prop_max:.1f} ms, "
-                                f"post_reset_max={reset_max:.1f} ms",
-                                flush=True,
-                            )
 
             total_ms = 1000.0 * (time.perf_counter() - started_total)
             self._prewarm_done.add(key)
@@ -412,14 +422,14 @@ class EfficientTAMTracker(Sam2StyleStreamingTracker):
                 )
 
             print(
-                "[EfficientTAM warmup] complete: "
+                "[stage] EfficientTAM single-view pre-warm complete: "
                 f"total={total_ms / 1000.0:.2f} s, "
                 f"verification_max_propagation={verify_max:.2f} ms",
                 flush=True,
             )
             if verify_max > 100.0:
                 print(
-                    "[EfficientTAM warmup] WARNING: the verification pass still "
+                    "[WARN] EfficientTAM pre-warm verification still "
                     f"contained a {verify_max:.1f} ms propagation. This suggests "
                     "GPU contention or an un-covered dynamic specialization remains.",
                     flush=True,
@@ -435,3 +445,416 @@ class EfficientTAMTracker(Sam2StyleStreamingTracker):
                 "temporal_frames": temporal_frames,
                 "results": results,
             }
+
+
+class EfficientTAMMultiViewTracker(EfficientTAMTracker):
+    """One EfficientTAM predictor shared by all synchronized camera views."""
+
+    def __init__(
+        self,
+        *args: Any,
+        num_views: int,
+        **kwargs: Any,
+    ) -> None:
+        self.num_views = max(1, int(num_views))
+        kwargs["fixed_num_views"] = self.num_views
+        super().__init__(*args, **kwargs)
+        self.streams: list[StreamingVideoState | None] = [None] * self.num_views
+        self.track_ids_per_view: list[list[int]] = [
+            [] for _ in range(self.num_views)
+        ]
+        self._live_prepared = False
+
+    def _state_prepared(self, state: dict[str, Any]) -> bool:
+        if not bool(state.get("multiview_prepared", False)):
+            return False
+        return self.execution_mode != "fixed_batch" or bool(
+            state.get("fixed_batch_prepared", False)
+        )
+
+    def _state_real_ids(self, state: dict[str, Any]) -> list[int]:
+        key = (
+            "fixed_batch_real_obj_ids"
+            if self.execution_mode == "fixed_batch"
+            else "obj_ids"
+        )
+        return [
+            int(value)
+            for value in state.get(key, [])
+            if isinstance(value, (int, np.integer))
+        ]
+
+    @property
+    def live_ready(self) -> bool:
+        if not self._live_prepared or any(stream is None for stream in self.streams):
+            return False
+        states = [stream.state for stream in self.streams if stream is not None]
+        return all(self._state_prepared(state) for state in states) and [
+            self._state_real_ids(state) for state in states
+        ] == self.track_ids_per_view
+
+    def _assert_prepared_states(self, states: list[dict[str, Any]]) -> None:
+        if len(states) != self.num_views:
+            raise RuntimeError(
+                f"Expected {self.num_views} live EfficientTAM states, got {len(states)}"
+            )
+        prepared = [self._state_prepared(state) for state in states]
+        actual_ids = [self._state_real_ids(state) for state in states]
+        if not all(prepared) or actual_ids != self.track_ids_per_view:
+            raise RuntimeError(
+                "EfficientTAM coordinated prepare failed: "
+                f"execution_mode={self.execution_mode}, prepared={prepared}, "
+                f"expected_ids={self.track_ids_per_view}, actual_ids={actual_ids}"
+            )
+
+    @staticmethod
+    def _clear_multiview_tags(state: dict[str, Any]) -> None:
+        for key in (
+            "fixed_batch_real_obj_ids",
+            "fixed_batch_real_obj_count",
+            "fixed_batch_dummy_obj_ids",
+            "fixed_batch_prepared",
+            "multiview_prepared",
+            "multiview_execution_mode",
+        ):
+            state.pop(key, None)
+
+    def _new_stream_from_rgb(
+        self,
+        rgb: np.ndarray,
+        *,
+        profiler: Any | None = None,
+        buffer_frames: int | None = None,
+    ) -> StreamingVideoState:
+        return StreamingVideoState(
+            self.predictor,
+            np.ascontiguousarray(rgb, dtype=np.uint8),
+            self.offload_video_to_cpu,
+            self.offload_state_to_cpu,
+            buffer_frames=(
+                self.stream_buffer_frames
+                if buffer_frames is None
+                else max(2, int(buffer_frames))
+            ),
+            profiler=profiler,
+            use_gpu_preprocess=self.gpu_preprocess,
+            pin_input_memory=self.pin_input_memory,
+        )
+
+    def _reset_or_create_streams(self, rgbs: list[np.ndarray]) -> None:
+        if len(rgbs) != self.num_views:
+            raise ValueError(f"Expected {self.num_views} RGB views, got {len(rgbs)}")
+
+        self._live_prepared = False
+        for view_idx, rgb in enumerate(rgbs):
+            stream = self.streams[view_idx]
+            if stream is None:
+                stream = self._new_stream_from_rgb(rgb)
+            elif self.reuse_state_on_keyframe:
+                stream.reset(rgb)
+            else:
+                stream.close()
+                stream = self._new_stream_from_rgb(rgb)
+            self.streams[view_idx] = stream
+            self._clear_multiview_tags(stream.state)
+
+    def _prediction_from_view_result(
+        self,
+        result: dict[str, Any],
+    ) -> TrackerPrediction:
+        masks = self._to_numpy_logits(result["video_res_masks"])
+        track_ids = [int(value) for value in result.get("obj_ids", [])]
+        if len(track_ids) != masks.shape[0]:
+            raise RuntimeError(
+                "EfficientTAM output ID/mask count mismatch: "
+                f"ids={len(track_ids)} masks={masks.shape[0]}"
+            )
+        return TrackerPrediction(
+            track_ids,
+            masks,
+            self._presence_from_logits(masks),
+            {
+                "backend": self.backend_name,
+                "execution_mode": self.execution_mode,
+                "frame_index": int(result.get("frame_idx", -1)),
+                "num_real_objects": int(
+                    result.get("num_real_objects", len(track_ids))
+                ),
+                "num_dummy_objects": int(result.get("num_dummy_objects", 0)),
+            },
+        )
+
+    def _seed_prediction(
+        self,
+        rgb: np.ndarray,
+        seeds: list[TrackerSeed],
+    ) -> TrackerPrediction:
+        height, width = rgb.shape[:2]
+        if seeds:
+            masks = np.stack(
+                [np.asarray(seed.mask, dtype=np.float32) for seed in seeds],
+                axis=0,
+            )
+            presence = np.asarray(
+                [float(seed.confidence) for seed in seeds],
+                dtype=np.float32,
+            )
+        else:
+            masks = np.empty((0, height, width), dtype=np.float32)
+            presence = np.empty((0,), dtype=np.float32)
+        return TrackerPrediction(
+            [int(seed.track_id) for seed in seeds],
+            masks,
+            presence,
+            {
+                "backend": self.backend_name,
+                "execution_mode": self.execution_mode,
+                "frame_index": 0,
+            },
+        )
+
+    def _prepare_live_states(self, states: list[dict[str, Any]]) -> None:
+        if self.execution_mode == "fixed_batch":
+            self.predictor.prepare_multiview_states(
+                states,
+                conditioning_frame_idx=0,
+            )
+            return
+
+        # Sequential propagation accepts an empty view, but upstream prepare
+        # requires at least one object. Mark empty views as prepared locally.
+        for state in states:
+            if state.get("obj_ids"):
+                self.predictor.prepare_multiview_states(
+                    [state],
+                    conditioning_frame_idx=0,
+                )
+            else:
+                state["multiview_prepared"] = True
+                state["multiview_execution_mode"] = "sequential"
+
+    def correct_views(
+        self,
+        rgbs: list[np.ndarray],
+        seeds_per_view: list[list[TrackerSeed]],
+    ) -> list[TrackerPrediction]:
+        """Reset, reseed and prepare all views on one coordinated keyframe."""
+        if len(seeds_per_view) != self.num_views:
+            raise ValueError(
+                f"Expected seeds for {self.num_views} views, got {len(seeds_per_view)}"
+            )
+        if self.execution_mode == "fixed_batch":
+            for view_idx, seeds in enumerate(seeds_per_view):
+                if len(seeds) > self.max_objects_per_view:
+                    raise RuntimeError(
+                        f"View {view_idx} has {len(seeds)} objects, but "
+                        f"max_objects_per_view={self.max_objects_per_view}"
+                    )
+
+        call_started = time.perf_counter()
+        with self._gpu_guard():
+            with torch.inference_mode(), self._autocast():
+                self._reset_or_create_streams(rgbs)
+                states: list[dict[str, Any]] = []
+                predictions: list[TrackerPrediction] = []
+
+                for view_idx, (rgb, seeds) in enumerate(zip(rgbs, seeds_per_view)):
+                    stream = self.streams[view_idx]
+                    assert stream is not None
+                    state = stream.state
+                    self.track_ids_per_view[view_idx] = [
+                        int(seed.track_id) for seed in seeds
+                    ]
+                    for seed in seeds:
+                        self.predictor.add_new_mask(
+                            inference_state=state,
+                            frame_idx=0,
+                            obj_id=int(seed.track_id),
+                            mask=np.asarray(seed.mask, dtype=bool),
+                        )
+                    states.append(state)
+                    predictions.append(self._seed_prediction(rgb, seeds))
+
+                self._prepare_live_states(states)
+                self._assert_prepared_states(states)
+                self._live_prepared = True
+
+        self.record_profile(
+            "tracker_total_wall_cpu",
+            1000.0 * (time.perf_counter() - call_started),
+        )
+        return predictions
+
+    def track_views(self, rgbs: list[np.ndarray]) -> list[TrackerPrediction]:
+        """Append one synchronized frame per view and propagate once."""
+        if len(rgbs) != self.num_views:
+            raise ValueError(f"Expected {self.num_views} RGB views, got {len(rgbs)}")
+        if any(stream is None for stream in self.streams):
+            raise RuntimeError(
+                "EfficientTAM is not initialized; run a coordinated keyframe first"
+            )
+        if not self.live_ready:
+            states = [stream.state for stream in self.streams if stream is not None]
+            raise RuntimeError(
+                "EfficientTAM is not prepared for multi-view propagation: "
+                f"execution_mode={self.execution_mode}, "
+                f"prepared={[self._state_prepared(s) for s in states]}, "
+                f"expected_ids={self.track_ids_per_view}, "
+                f"actual_ids={[self._state_real_ids(s) for s in states]}"
+            )
+
+        call_started = time.perf_counter()
+        with self._gpu_guard():
+            with torch.inference_mode(), self._autocast():
+                states: list[dict[str, Any]] = []
+                frame_indices: list[int] = []
+                for stream, rgb in zip(self.streams, rgbs):
+                    assert stream is not None
+                    frame_indices.append(stream.append(rgb))
+                    states.append(stream.state)
+
+                if len(set(frame_indices)) != 1:
+                    raise RuntimeError(
+                        "Multi-view streams became misaligned: "
+                        f"frame_indices={frame_indices}"
+                    )
+                results = self.predictor.propagate_multiview_step(
+                    states,
+                    frame_idx=frame_indices[0],
+                    reverse=False,
+                )
+                predictions = [
+                    self._prediction_from_view_result(result) for result in results
+                ]
+
+        self.record_profile(
+            "tracker_total_wall_cpu",
+            1000.0 * (time.perf_counter() - call_started),
+        )
+        return predictions
+
+    def prewarm_views(self, first_rgbs: list[np.ndarray]) -> dict[str, Any]:
+        """Compile the selected multi-view execution shape before live tracking."""
+        if not self.prewarm_enabled or not self.vos_optimized:
+            return {"enabled": False, "performed": False}
+        if len(first_rgbs) != self.num_views:
+            raise ValueError(
+                f"Expected {self.num_views} prewarm views, got {len(first_rgbs)}"
+            )
+
+        rgbs = [np.ascontiguousarray(rgb, dtype=np.uint8) for rgb in first_rgbs]
+        shapes = {rgb.shape for rgb in rgbs}
+        if len(shapes) != 1:
+            raise RuntimeError(
+                f"All prewarm views must share one resolution, got {sorted(shapes)}"
+            )
+
+        temporal_frames = self._resolved_prewarm_temporal_frames()
+        key = (
+            id(self.predictor),
+            "multiview",
+            self.execution_mode,
+            self.num_views,
+            self.max_objects_per_view,
+            tuple(rgbs[0].shape),
+            temporal_frames,
+            self.prewarm_post_reset_frames,
+            self.prewarm_passes,
+            str(self.device),
+            bool(self.use_bf16),
+        )
+
+        with self._prewarm_lock:
+            if key in self._prewarm_done:
+                return {"enabled": True, "performed": False, "already_warm": True}
+
+            print(
+                "[stage] EfficientTAM pre-warm: "
+                f"mode={self.execution_mode}, views={self.num_views}, "
+                f"max_objects/view={self.max_objects_per_view}, "
+                f"temporal_frames={temporal_frames}, passes={self.prewarm_passes}",
+                flush=True,
+            )
+            started_total = time.perf_counter()
+            propagation_ms: list[float] = []
+            buffer_frames = max(self.stream_buffer_frames, temporal_frames + 4)
+
+            with self._gpu_guard():
+                with torch.inference_mode(), self._autocast():
+                    for pass_index in range(self.prewarm_passes):
+                        temp_streams = [
+                            self._new_stream_from_rgb(rgb, buffer_frames=buffer_frames)
+                            for rgb in rgbs
+                        ]
+                        try:
+                            states = [stream.state for stream in temp_streams]
+                            for view_idx, state in enumerate(states):
+                                masks = _synthetic_masks(
+                                    rgbs[view_idx].shape[0],
+                                    rgbs[view_idx].shape[1],
+                                    self.max_objects_per_view,
+                                )
+                                for obj_idx, mask in enumerate(masks, start=1):
+                                    self.predictor.add_new_mask(
+                                        inference_state=state,
+                                        frame_idx=0,
+                                        obj_id=obj_idx,
+                                        mask=mask,
+                                    )
+                            self.predictor.prepare_multiview_states(
+                                states,
+                                conditioning_frame_idx=0,
+                            )
+
+                            for frame_idx in range(1, temporal_frames + 1):
+                                for view_idx, stream in enumerate(temp_streams):
+                                    stream.append(
+                                        self._variant_rgb(
+                                            rgbs[view_idx],
+                                            frame_idx + 31 * view_idx,
+                                        )
+                                    )
+                                started = time.perf_counter()
+                                self.predictor.propagate_multiview_step(
+                                    states,
+                                    frame_idx=frame_idx,
+                                    reverse=False,
+                                )
+                                if (
+                                    torch.cuda.is_available()
+                                    and str(self.device).startswith("cuda")
+                                ):
+                                    torch.cuda.synchronize(torch.device(self.device))
+                                propagation_ms.append(
+                                    1000.0 * (time.perf_counter() - started)
+                                )
+                        finally:
+                            for stream in temp_streams:
+                                stream.close()
+
+            total_ms = 1000.0 * (time.perf_counter() - started_total)
+            self._prewarm_done.add(key)
+            verify_max = max(propagation_ms[-temporal_frames:] or [0.0])
+            print(
+                "[stage] EfficientTAM pre-warm complete: "
+                f"total={total_ms / 1000.0:.2f} s, "
+                f"verification_max={verify_max:.2f} ms",
+                flush=True,
+            )
+            return {
+                "enabled": True,
+                "performed": True,
+                "total_ms": total_ms,
+                "verification_max_ms": verify_max,
+                "execution_mode": self.execution_mode,
+                "views": self.num_views,
+                "max_objects_per_view": self.max_objects_per_view,
+            }
+
+    def close(self) -> None:
+        self._live_prepared = False
+        for stream in self.streams:
+            if stream is not None:
+                stream.close()
+        self.streams = [None] * self.num_views
+        self.track_ids_per_view = [[] for _ in range(self.num_views)]

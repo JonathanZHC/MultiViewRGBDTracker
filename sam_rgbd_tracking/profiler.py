@@ -180,7 +180,7 @@ class FrameProfiler:
         )
 
     def print_summary(self) -> None:
-        if not self.enabled:
+        if not self.enabled or self._frames == 0:
             return
         print(f"[Profiler:{self.name}] frames={self._frames}", flush=True)
         keys = self.PREFERRED_ORDER + sorted(

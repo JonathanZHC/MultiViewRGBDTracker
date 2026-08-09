@@ -25,7 +25,7 @@ ARG SAM3_REPOSITORY=https://github.com/facebookresearch/sam3.git
 ARG SAM3_REF=main
 ARG SAM_MT_REPOSITORY=https://github.com/FudanCVL/SAM-MT.git
 ARG SAM_MT_REF=main
-ARG EFFICIENT_TAM_REPOSITORY=https://github.com/yformer/EfficientTAM.git
+ARG EFFICIENT_TAM_REPOSITORY=https://github.com/JonathanZHC/EfficientTAM.git
 ARG EFFICIENT_TAM_REF=main
 
 ENV LANG=en_US.UTF-8 \

@@ -133,6 +133,11 @@ class SamMTTracker(Sam2StyleStreamingTracker):
                     "reason": "already_warm",
                 }
 
+            print(
+                "[stage] SAM-MT image-encoder pre-warm: "
+                f"passes={self.prewarm_passes}",
+                flush=True,
+            )
             started = time.perf_counter()
             pass_ms: list[float] = []
             stream: StreamingVideoState | None = None
@@ -174,17 +179,10 @@ class SamMTTracker(Sam2StyleStreamingTracker):
                             # backbone output inside _get_image_feature.
                             del backbone_out
 
-                            print(
-                                "[SAM-MT image-encoder warmup] "
-                                f"pass={pass_index + 1}/{self.prewarm_passes} "
-                                f"wall={elapsed_ms:.1f} ms",
-                                flush=True,
-                            )
-
                 self._image_encoder_prewarm_done.add(key)
                 total_ms = 1000.0 * (time.perf_counter() - started)
                 print(
-                    "[SAM-MT image-encoder warmup] complete "
+                    "[stage] SAM-MT image-encoder pre-warm complete "
                     f"total={total_ms:.1f} ms",
                     flush=True,
                 )

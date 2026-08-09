@@ -39,39 +39,11 @@ except ImportError:  # pragma: no cover
 
 
 class SAMTrackingComponent:
-    """Reusable SAM3 + mask-tracker RGB-D component with no ROS dependency.
+    """Per-camera SAM3 association and RGB-D post-processing.
 
-    The 2-D mask path is intentionally depth-independent:
-
-        tracker/SAM3 logits
-            -> threshold
-            -> optional 2-D erosion/component filtering
-            -> output mask
-
-    Depth is used only for 3-D geometry (point-cloud backprojection and the
-    optional 3-D centroid cue used by keyframe association). It is never used
-    to reject mask pixels, resolve overlapping masks, or classify occlusion.
-
-    Typical plugin use::
-
-        component = SAMTrackingComponent(
-            "configs/tracking.yaml",
-            backend="efficient_tam",
-        )
-        result = component.process_arrays(
-            rgb,
-            depth_m,
-            fx=...,
-            fy=...,
-            cx=...,
-            cy=...,
-            world_from_camera=T_world_camera,
-        )
-
-    ``result.instances`` contains persistent IDs, 2-D masks and per-instance
-    point clouds. Overlapping instance masks are preserved. ``owner_track_map``
-    assigns IDs only where exactly one instance mask is present; overlap pixels
-    are 0 so an external occlusion/ownership method can handle them explicitly.
+    2-D masks are depth-independent. Depth is used only for 3-D geometry and
+    the optional centroid cue used during keyframe association. The component
+    can own a tracker or participate in the shared multi-view EfficientTAM path.
     """
 
     def __init__(
@@ -82,6 +54,7 @@ class SAMTrackingComponent:
         backend: str | None = None,
         detector: InstanceDetector | None = None,
         tracker: MultiObjectTracker | None = None,
+        build_tracker_backend: bool = True,
     ) -> None:
         if isinstance(config, (str, Path)):
             config = load_config(config, tracker=backend)
@@ -97,8 +70,13 @@ class SAMTrackingComponent:
             name=f"{camera_name}/{config.tracker.backend}",
         )
         self.detector = detector or build_detector(config)
-        self.tracker = tracker or build_tracker(config)
-        if hasattr(self.tracker, "set_profiler"):
+        if tracker is not None:
+            self.tracker: MultiObjectTracker | None = tracker
+        elif build_tracker_backend:
+            self.tracker = build_tracker(config)
+        else:
+            self.tracker = None
+        if self.tracker is not None and hasattr(self.tracker, "set_profiler"):
             self.tracker.set_profiler(self.profiler)
 
         self.tracks: dict[int, TrackState] = {}
@@ -128,12 +106,14 @@ class SAMTrackingComponent:
 
     def prewarm_tracker(self, first_rgb: np.ndarray) -> dict:
         """Pre-warm backend-specific compiled tracker paths without changing live state."""
+        if self.tracker is None:
+            return {"enabled": False, "performed": False, "reason": "external_tracker"}
         prewarm = getattr(self.tracker, "prewarm", None)
         if not callable(prewarm):
             return {"enabled": False, "performed": False}
         return dict(prewarm(np.ascontiguousarray(first_rgb, dtype=np.uint8)))
 
-    def process_arrays(
+    def make_frame(
         self,
         rgb: np.ndarray,
         depth_m: np.ndarray,
@@ -144,7 +124,12 @@ class SAMTrackingComponent:
         cy: float,
         timestamp_ns: int = 0,
         world_from_camera: np.ndarray | None = None,
-    ) -> FrameResult:
+    ) -> RGBDFrame:
+        """Create the next per-view frame without running the tracker.
+
+        The multi-view EfficientTAM coordinator uses this to construct all view
+        frames first, then executes one shared tracking call for the whole bundle.
+        """
         h, w = depth_m.shape
         frame = RGBDFrame(
             camera_name=self.camera_name,
@@ -167,9 +152,38 @@ class SAMTrackingComponent:
             ),
         )
         self.frame_index += 1
+        return frame
+
+    def process_arrays(
+        self,
+        rgb: np.ndarray,
+        depth_m: np.ndarray,
+        *,
+        fx: float,
+        fy: float,
+        cx: float,
+        cy: float,
+        timestamp_ns: int = 0,
+        world_from_camera: np.ndarray | None = None,
+    ) -> FrameResult:
+        frame = self.make_frame(
+            rgb,
+            depth_m,
+            fx=fx,
+            fy=fy,
+            cx=cx,
+            cy=cy,
+            timestamp_ns=timestamp_ns,
+            world_from_camera=world_from_camera,
+        )
         return self.process(frame)
 
     def process(self, frame: RGBDFrame) -> FrameResult:
+        if self.tracker is None:
+            raise RuntimeError(
+                "This SAMTrackingComponent is attached to an external multi-view "
+                "tracker; call the multi-view coordinator instead of process()."
+            )
         self.profiler.begin_frame()
         trigger_reasons: list[str] = []
         keyframe = self._periodic_keyframe(frame.frame_index)
@@ -200,6 +214,57 @@ class SAMTrackingComponent:
             keyframe=keyframe,
             timings_ms=timings,
             metadata={"trigger_reasons": trigger_reasons},
+        )
+
+    # ------------------------------------------------------------------
+    # Multi-view coordination helpers
+    # ------------------------------------------------------------------
+
+    def begin_external_frame(self) -> None:
+        self.profiler.begin_frame()
+
+    def needs_periodic_keyframe(self, frame_index: int) -> bool:
+        return self._periodic_keyframe(frame_index)
+
+    def needs_anomaly_keyframe(
+        self,
+        frame_index: int,
+        prediction: TrackerPrediction,
+    ) -> bool:
+        return self._anomaly_keyframe(frame_index, prediction)
+
+    def detect_and_seed(self, frame: RGBDFrame) -> list[TrackerSeed]:
+        """Run SAM3 + association for one view, without touching a tracker."""
+        with self.profiler.stage("sam3_total_gpu", cuda=True):
+            detections = self.detector.detect(frame)
+        return self._associate_and_seed(frame, detections)
+
+    def mark_keyframe(self, frame_index: int) -> None:
+        self.last_keyframe = int(frame_index)
+
+    def finalize_external_prediction(
+        self,
+        frame: RGBDFrame,
+        prediction: TrackerPrediction,
+        *,
+        keyframe: bool,
+        trigger_reasons: list[str],
+        update_raw_observations: bool,
+    ) -> FrameResult:
+        """Finish one view after a shared multi-view tracker invocation."""
+        if update_raw_observations:
+            self._update_raw_observations(prediction)
+        self.last_prediction = prediction
+        with self.profiler.stage("postprocess_cpu", cuda=False):
+            instances, owner = self._postprocess(frame, prediction)
+        timings = self.profiler.end_frame()
+        return FrameResult(
+            frame=frame,
+            instances=instances,
+            owner_track_map=owner,
+            keyframe=bool(keyframe),
+            timings_ms=timings,
+            metadata={"trigger_reasons": list(trigger_reasons)},
         )
 
     def _periodic_keyframe(self, frame_index: int) -> bool:
@@ -415,7 +480,7 @@ class SAMTrackingComponent:
 
         threshold = float(self.config.postprocess.mask_threshold)
 
-        # Important: mask construction is now completely independent of depth.
+        # Mask construction is independent of depth.
         raw_masks = [logits[channel] > threshold for channel in range(len(track_ids))]
         final_masks = [
             erode_and_filter(
@@ -426,8 +491,7 @@ class SAMTrackingComponent:
             for raw_mask in raw_masks
         ]
 
-        # This map does not resolve overlaps. Ambiguous overlap pixels remain 0
-        # for the user's external ownership/occlusion method.
+        # Overlap pixels stay 0 for external ownership/occlusion handling.
         owner_track_map = nonoverlap_owner_map(
             final_masks,
             track_ids,
@@ -435,8 +499,7 @@ class SAMTrackingComponent:
             w,
         )
 
-        # Depth validity affects only 3-D point generation. It never removes
-        # pixels from raw_mask/final_mask.
+        # Depth validity affects only 3-D point generation.
         valid_geometry_depth = valid_depth_mask(
             frame.depth_m,
             float(self.config.postprocess.min_valid_depth_m),
@@ -494,9 +557,7 @@ class SAMTrackingComponent:
                 track.missing_frames += 1
                 status = VisibilityState.LOST
 
-            # The old motion confidence multiplied depth-visibility and
-            # depth-consistency terms. Those terms no longer exist, so this is
-            # now simply the tracker's own confidence.
+            # Motion confidence is the tracker confidence; no depth visibility term.
             motion_conf = float(
                 np.clip(track.tracking_confidence, 0.0, 1.0)
             )
@@ -532,4 +593,5 @@ class SAMTrackingComponent:
         self.profiler.print_summary()
 
     def close(self) -> None:
-        self.tracker.close()
+        if self.tracker is not None:
+            self.tracker.close()

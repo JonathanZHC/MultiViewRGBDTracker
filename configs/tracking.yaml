@@ -18,8 +18,16 @@ ros:
   output_prefix: /tracking/{camera}
   sync_slop_seconds: 0.02
 
-# SAM3 runs only on keyframes. Intermediate frames are handled by the selected
-# mask tracker. Edit this section when you want to change prompts/refresh rate.
+  # After each camera has formed a local RGB-D+CameraInfo tuple, EfficientTAM
+  # fixed batching waits for one tuple from every view. Their color timestamps
+  # must fall inside this cross-view window. Isaac Sim publishes the two cameras
+  # from the same capture tick, so 20 ms is intentionally conservative.
+  multiview_sync_slop_seconds: 0.02
+
+# SAM3 runs only on coordinated keyframes. Intermediate frames are handled by
+# the selected mask tracker. With EfficientTAM multi-view execution, if one view
+# requests a periodic/anomaly refresh, all views refresh together so their
+# temporal-memory topology stays aligned.
 detector:
   checkpoint: checkpoints/sam3.pt
   prompts:
@@ -29,29 +37,54 @@ detector:
   score_threshold: 0.05
   mask_threshold: 0.0
   duplicate_iou_threshold: 0.85
-  refresh_seconds: 1.0
+  refresh_seconds: 5.0
   phase_offsets_seconds:
     camera_0: 0.0
     camera_1: 0.0
-  trigger_on_anomaly: true
+  trigger_on_anomaly: false
   min_frames_between_triggers: 5
   anomaly_presence_threshold: 0.05
 
 tracker:
-  backend: sam_mt               # sam_mt | efficient_tam
+  backend: efficient_tam         # sam_mt | efficient_tam
   mask_threshold: 0.0
   offload_video_to_cpu: false
   offload_state_to_cpu: false
   vos_optimized: true
+
+  # Shared streaming-state/runtime options.
+  reuse_state_on_keyframe: true
+  gpu_preprocess: true
+  pin_input_memory: true
+
   sam_mt:
     checkpoint: checkpoints/sam_mt.pt
     config: configs/sam2.1/sam2.1_hiera_b+.yaml
     non_overlap_masks: true
     points_per_object: 2
+    compile_image_encoder: true
+    prewarm_enabled: true
+    prewarm_passes: 2
+
   efficient_tam:
-    checkpoint: checkpoints/efficienttam_s_2.pt
-    config: configs/efficienttam/efficienttam_s_2.yaml
+    checkpoint: checkpoints/efficienttam_s_512x512.pt
+    config: configs/efficienttam/efficienttam_s_512x512.yaml
     non_overlap_masks: false
+
+    # Main switch requested for the integration.
+    # sequential  -> per-view encoder + per-object B=1 propagation (old compute)
+    # fixed_batch -> one B=num_views encoder + one fixed all-view/object batch
+    execution_mode: fixed_batch # sequential | fixed_batch
+
+    # fixed_num_views is derived automatically from runtime.camera_names.
+    # With two cameras and max_objects_per_view=3, fixed_batch uses B=6.
+    max_objects_per_view: 3
+
+    # Compile/capture the actual multi-view shape before live diagnostics start.
+    prewarm_enabled: true
+    prewarm_temporal_frames: 20
+    prewarm_post_reset_frames: 2
+    prewarm_passes: 2
 
 association:
   max_centroid_distance_m: 0.35
@@ -65,7 +98,7 @@ association:
 
 postprocess:
   mask_threshold: 0.0
-  overlap_depth_only: False
+  overlap_depth_only: false
   depth_model_min_pixels: 40
   depth_gate_mad_scale: 4.0
   depth_gate_min_m: 0.035
@@ -89,3 +122,6 @@ profiling:
   summary_interval_frames: 100
   cuda_events: true
   csv_path: logs/timing.csv
+  rate_diagnostics: true
+  camera_diagnostics: true
+  rate_summary_interval_seconds: 5.0
