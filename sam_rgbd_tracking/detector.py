@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from contextlib import nullcontext
+import time
 from pathlib import Path
 from typing import Any, ClassVar, Protocol
 
@@ -9,24 +9,36 @@ import numpy as np
 from PIL import Image
 
 from .data_types import DetectionInstance, RGBDFrame
-from .processing import color_embedding, mask_iou
-from .trackers.base import GLOBAL_CUDA_LOCK
+from .processing import mask_iou
+from .slots import class_capacities
 
 try:
     import torch
+    import torch.nn.functional as F
 except ImportError:  # pragma: no cover
     torch = None
+    F = None
 
 
 class InstanceDetector(Protocol):
-    """Minimal detector interface used by :class:`SAMTrackingComponent`."""
-
     def detect(self, frame: RGBDFrame) -> list[DetectionInstance]:
+        ...
+
+    def detect_batch(
+        self,
+        frames: list[RGBDFrame],
+    ) -> list[list[DetectionInstance]]:
         ...
 
 
 class Sam3Detector:
-    """Text-prompted SAM3 image detector with one shared model per GPU."""
+    """Text-prompted SAM3 detector with true multi-image image batching.
+
+    All synchronized camera images share one SAM3 image-backbone forward. Each
+    text prompt is then grounded against the whole image batch in one model
+    forward. The public single-image ``detect`` method is retained as a thin
+    wrapper for debugging/tests.
+    """
 
     _cache: ClassVar[dict[tuple[str, str], tuple[Any, Any]]] = {}
     _cache_lock: ClassVar[threading.Lock] = threading.Lock()
@@ -37,12 +49,28 @@ class Sam3Detector:
         self.checkpoint = str(config.detector.checkpoint)
         self.device = str(config.runtime.device)
         self.use_bf16 = bool(config.runtime.get("use_bf16", True))
-        self.serialize_gpu = bool(config.runtime.get("serialize_gpu", True))
-        self.prompts = [str(v) for v in config.detector.prompts]
+        self.capacities = class_capacities(config)
+        self.prompts = list(self.capacities)
         self.score_threshold = float(config.detector.score_threshold)
-        self.mask_threshold = float(config.detector.mask_threshold)
         self.duplicate_iou = float(config.detector.duplicate_iou_threshold)
+        self.min_mask_pixels = int(config.detector.get("min_mask_pixels", 30))
+        self.last_filter_ms = 0.0
+        self.last_counts_per_view: list[dict[str, int]] = []
         self.model, self.processor = self._get_or_build()
+
+        # ``set_text_prompt`` used by the previous implementation already applied
+        # the processor's own confidence/mask thresholds before our config-level
+        # filtering. The batched path calls the model directly, so preserve that
+        # effective behavior instead of accidentally admitting many extra queries.
+        processor_score_threshold = float(
+            getattr(self.processor, "confidence_threshold", 0.0)
+        )
+        self.effective_score_threshold = max(
+            self.score_threshold, processor_score_threshold
+        )
+        self.effective_mask_threshold = float(
+            getattr(self.processor, "mask_threshold", 0.5)
+        )
 
     def _get_or_build(self) -> tuple[Any, Any]:
         key = (self.checkpoint, self.device)
@@ -71,101 +99,206 @@ class Sam3Detector:
             self._cache[key] = (model, processor)
             return model, processor
 
-    def detect(self, frame: RGBDFrame) -> list[DetectionInstance]:
-        image = Image.fromarray(
-            np.ascontiguousarray(frame.rgb).astype(np.uint8),
+    @staticmethod
+    def _pil(rgb: np.ndarray) -> Image.Image:
+        return Image.fromarray(
+            np.ascontiguousarray(rgb, dtype=np.uint8),
             mode="RGB",
         )
-        detections: list[DetectionInstance] = []
-        lock = (
-            GLOBAL_CUDA_LOCK
-            if self.serialize_gpu and self.device.startswith("cuda")
-            else nullcontext()
-        )
-        autocast_enabled = self.use_bf16 and self.device.startswith("cuda")
 
-        with lock, torch.inference_mode():
-            with torch.autocast(
-                device_type="cuda",
-                dtype=torch.bfloat16,
-                enabled=autocast_enabled,
-            ):
-                state = self.processor.set_image(image)
-                for prompt in self.prompts:
-                    output = self.processor.set_text_prompt(
-                        state=state,
-                        prompt=prompt,
-                    )
-                    masks = output.get("masks")
-                    scores = output.get("scores")
-                    boxes = output.get("boxes")
-                    if masks is None:
+    def _append_candidate(
+        self,
+        detections: list[DetectionInstance],
+        *,
+        prompt: str,
+        score: float,
+        mask: np.ndarray,
+        bbox: tuple[float, float, float, float] | None,
+    ) -> None:
+        # Keep this path intentionally tiny. Config-level thresholding, tiny-mask
+        # rejection, same-class deduplication and per-class top-K happen together
+        # after all prompt forwards, so one semantic class can never consume the
+        # capacity reserved for another class.
+        detections.append(
+            DetectionInstance(
+                detection_id=0,
+                label=prompt,
+                score=float(score),
+                mask=np.asarray(mask, dtype=bool),
+                bbox_xyxy=bbox,
+                embedding=None,
+            )
+        )
+
+    def _filter_view_candidates(
+        self,
+        candidates: list[DetectionInstance],
+    ) -> tuple[list[DetectionInstance], dict[str, int]]:
+        filtered: list[DetectionInstance] = []
+        counts: dict[str, int] = {}
+        for label in self.prompts:
+            capacity = int(self.capacities[label])
+            class_candidates = [
+                item
+                for item in candidates
+                if item.label == label
+                and float(item.score) >= self.effective_score_threshold
+                and int(np.count_nonzero(item.mask)) >= self.min_mask_pixels
+            ]
+            class_candidates.sort(key=lambda item: float(item.score), reverse=True)
+
+            kept: list[DetectionInstance] = []
+            for candidate in class_candidates:
+                if any(
+                    mask_iou(candidate.mask, existing.mask) >= self.duplicate_iou
+                    for existing in kept
+                ):
+                    continue
+                kept.append(candidate)
+                if len(kept) >= capacity:
+                    break
+
+            counts[label] = len(kept)
+            filtered.extend(kept)
+
+        for detection_id, item in enumerate(filtered, start=1):
+            item.detection_id = detection_id
+        return filtered, counts
+
+    @torch.inference_mode()
+    def detect_rgb_batch(
+        self,
+        rgbs: list[np.ndarray],
+    ) -> list[list[DetectionInstance]]:
+        """Run SAM3 on all synchronized RGB views in one image batch."""
+        if not rgbs:
+            return []
+        if not hasattr(self.processor, "set_image_batch"):
+            raise RuntimeError(
+                "This SAM3 checkout has no Sam3Processor.set_image_batch(). "
+                "Update SAM3 before using the EfficientTAM-only async pipeline."
+            )
+
+        from sam3.model import box_ops
+        from sam3.model.data_misc import FindStage
+
+        images = [self._pil(rgb) for rgb in rgbs]
+        batch_size = len(images)
+        autocast_enabled = self.use_bf16 and self.device.startswith("cuda")
+        detections_per_view: list[list[DetectionInstance]] = [
+            [] for _ in range(batch_size)
+        ]
+
+        with torch.autocast(
+            device_type="cuda",
+            dtype=torch.bfloat16,
+            enabled=autocast_enabled,
+        ):
+            state = self.processor.set_image_batch(images)
+            device = torch.device(self.device)
+            find_stage = FindStage(
+                img_ids=torch.arange(batch_size, device=device, dtype=torch.long),
+                text_ids=torch.zeros(batch_size, device=device, dtype=torch.long),
+                input_boxes=None,
+                input_boxes_mask=None,
+                input_boxes_label=None,
+                input_points=None,
+                input_points_mask=None,
+            )
+
+            for prompt in self.prompts:
+                text_outputs = self.model.backbone.forward_text(
+                    [prompt],
+                    device=self.device,
+                )
+                state["backbone_out"].update(text_outputs)
+                geometric_prompt = self.model._get_dummy_prompt(
+                    num_prompts=batch_size
+                )
+                output = self.model.forward_grounding(
+                    backbone_out=state["backbone_out"],
+                    find_input=find_stage,
+                    geometric_prompt=geometric_prompt,
+                    find_target=None,
+                )
+
+                logits = output["pred_logits"]
+                if logits.ndim == 2:
+                    logits = logits.unsqueeze(-1)
+                probabilities = logits.sigmoid().squeeze(-1)
+
+                presence = output.get("presence_logit_dec")
+                if presence is not None:
+                    presence = presence.sigmoid().reshape(batch_size, -1)[:, :1]
+                    probabilities = probabilities * presence
+
+                boxes_xyxy = box_ops.box_cxcywh_to_xyxy(output["pred_boxes"])
+                masks_logits = output["pred_masks"]
+
+                for view_idx, rgb in enumerate(rgbs):
+                    keep = probabilities[view_idx] > self.effective_score_threshold
+                    if not bool(keep.any()):
                         continue
 
-                    masks_np = (
-                        masks.detach().float().cpu().numpy()
-                        if hasattr(masks, "detach")
-                        else np.asarray(masks)
+                    scores = probabilities[view_idx][keep]
+                    boxes = boxes_xyxy[view_idx][keep]
+                    masks = masks_logits[view_idx][keep]
+                    height, width = rgb.shape[:2]
+                    masks = F.interpolate(
+                        masks.unsqueeze(1),
+                        size=(height, width),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).sigmoid()[:, 0]
+
+                    scale = torch.tensor(
+                        [width, height, width, height],
+                        dtype=boxes.dtype,
+                        device=boxes.device,
                     )
-                    scores_np = (
-                        scores.detach().float().cpu().numpy()
-                        if scores is not None and hasattr(scores, "detach")
-                        else np.asarray(
-                            scores
-                            if scores is not None
-                            else np.ones(len(masks_np))
+                    boxes = boxes * scale
+
+                    masks_np = masks.detach().float().cpu().numpy()
+                    scores_np = scores.detach().float().cpu().numpy()
+                    boxes_np = boxes.detach().float().cpu().numpy()
+
+                    for index in range(len(scores_np)):
+                        mask = masks_np[index] > self.effective_mask_threshold
+                        if not mask.any():
+                            continue
+                        bbox_values = boxes_np[index].reshape(-1)
+                        bbox = (
+                            tuple(float(v) for v in bbox_values[:4])
+                            if bbox_values.size >= 4
+                            else None
                         )
-                    )
-                    boxes_np = (
-                        boxes.detach().float().cpu().numpy()
-                        if boxes is not None and hasattr(boxes, "detach")
-                        else (np.asarray(boxes) if boxes is not None else None)
-                    )
-
-                    while masks_np.ndim > 3 and masks_np.shape[0] == 1:
-                        masks_np = masks_np[0]
-                    if masks_np.ndim == 2:
-                        masks_np = masks_np[None]
-                    scores_np = scores_np.reshape(-1)
-
-                    for index in range(min(len(masks_np), len(scores_np))):
-                        score = float(scores_np[index])
-                        if score < self.score_threshold:
-                            continue
-                        mask = np.asarray(masks_np[index]) > self.mask_threshold
-                        if mask.shape != frame.depth_m.shape or not mask.any():
-                            continue
-
-                        bbox = None
-                        if boxes_np is not None and index < len(boxes_np):
-                            values = np.asarray(boxes_np[index]).reshape(-1)
-                            if values.size >= 4:
-                                bbox = tuple(float(v) for v in values[:4])
-
-                        candidate = DetectionInstance(
-                            detection_id=0,
-                            label=prompt,
-                            score=score,
+                        self._append_candidate(
+                            detections_per_view[view_idx],
+                            prompt=prompt,
+                            score=float(scores_np[index]),
                             mask=mask,
-                            bbox_xyxy=bbox,
-                            embedding=color_embedding(frame.rgb, mask),
+                            bbox=bbox,
                         )
-                        duplicate = next(
-                            (
-                                item_index
-                                for item_index, item in enumerate(detections)
-                                if mask_iou(mask, item.mask) >= self.duplicate_iou
-                            ),
-                            None,
-                        )
-                        if duplicate is None:
-                            detections.append(candidate)
-                        elif score > detections[duplicate].score:
-                            detections[duplicate] = candidate
 
-        for detection_id, item in enumerate(detections, start=1):
-            item.detection_id = detection_id
-        return detections
+        filter_started = time.perf_counter()
+        filtered_per_view: list[list[DetectionInstance]] = []
+        counts_per_view: list[dict[str, int]] = []
+        for candidates in detections_per_view:
+            filtered, counts = self._filter_view_candidates(candidates)
+            filtered_per_view.append(filtered)
+            counts_per_view.append(counts)
+        self.last_filter_ms = 1000.0 * (time.perf_counter() - filter_started)
+        self.last_counts_per_view = counts_per_view
+        return filtered_per_view
+
+    def detect_batch(
+        self,
+        frames: list[RGBDFrame],
+    ) -> list[list[DetectionInstance]]:
+        return self.detect_rgb_batch([frame.rgb for frame in frames])
+
+    def detect(self, frame: RGBDFrame) -> list[DetectionInstance]:
+        return self.detect_rgb_batch([frame.rgb])[0]
 
 
 def build_detector(config) -> Sam3Detector:

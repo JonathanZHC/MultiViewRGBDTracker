@@ -3,13 +3,22 @@ runtime:
   target_hz: 30.0
   queue_size: 1
   drop_when_busy: true
-  serialize_gpu: true
+
+  # Only one EfficientTAM worker owns tracker state. SAM3 runs on a separate
+  # worker/CUDA stream, so do not serialize both models through the old global lock.
+  serialize_gpu: false
   device: cuda
   use_bf16: true
   enable_tf32: true
-  publish_debug_images: true
 
-# Exact topic names published by ScenePredictor/YOLOE isaacscene/ros_camera_publisher.py.
+  # Keep visualization inside the synchronous measured pipeline.  When false,
+  # no RViz messages are built or published.
+  enable_visualization: true
+
+  # When visualization is enabled, publish both raw and filtered mask debug
+  # images every frame.
+  publish_debug_images: true
+  
 ros:
   world_frame: world
   color_topic: /{camera}/color/image_raw
@@ -18,104 +27,102 @@ ros:
   output_prefix: /tracking/{camera}
   sync_slop_seconds: 0.02
 
-  # After each camera has formed a local RGB-D+CameraInfo tuple, EfficientTAM
-  # fixed batching waits for one tuple from every view. Their color timestamps
-  # must fall inside this cross-view window. Isaac Sim publishes the two cameras
-  # from the same capture tick, so 20 ms is intentionally conservative.
+  # Local RGB-D tuples are paired across all cameras before EfficientTAM/SAM3.
   multiview_sync_slop_seconds: 0.02
 
-# SAM3 runs only on coordinated keyframes. Intermediate frames are handled by
-# the selected mask tracker. With EfficientTAM multi-view execution, if one view
-# requests a periodic/anomaly refresh, all views refresh together so their
-# temporal-memory topology stays aligned.
+pointcloud:
+  stride: 1
+  max_points_per_instance: 8192
+  transform_to_world: true
+
+# SAM3 is now a sparse asynchronous B=num_views detector. The initial SAM3 call
+# is blocking only because no tracker state exists yet. Later refreshes never
+# queue: if one SAM3 job is already in flight, another trigger is skipped.
 detector:
   checkpoint: checkpoints/sam3.pt
+
+  # [semantic class, fixed EfficientTAM capacity]. Keep the class and its
+  # capacity together so adding/removing an object only changes this list.
+  # Total local slots/view = 1+1+1 = 3; inactive capacity stays reserved.
   prompts:
-    - ball
-    - red and white can
-    - mustard bottle
-  score_threshold: 0.05
-  mask_threshold: 0.0
-  duplicate_iou_threshold: 0.85
-  refresh_seconds: 5.0
-  phase_offsets_seconds:
-    camera_0: 0.0
-    camera_1: 0.0
+    - [ball, 1]
+    - [red mug, 1]
+    # - [red and white can, 1]
+    - [mustard bottle, 1]
+
+  score_threshold: 0.4
+  duplicate_iou_threshold: 0.7
+  min_mask_pixels: 30
+
+  refresh_seconds: 1.0
   trigger_on_anomaly: false
   min_frames_between_triggers: 5
   anomaly_presence_threshold: 0.05
 
 tracker:
-  backend: efficient_tam         # sam_mt | efficient_tam
-  mask_threshold: 0.0
   offload_video_to_cpu: false
   offload_state_to_cpu: false
   vos_optimized: true
-
-  # Shared streaming-state/runtime options.
-  reuse_state_on_keyframe: true
   gpu_preprocess: true
   pin_input_memory: true
 
-  sam_mt:
-    checkpoint: checkpoints/sam_mt.pt
-    config: configs/sam2.1/sam2.1_hiera_b+.yaml
-    non_overlap_masks: true
-    points_per_object: 2
-    compile_image_encoder: true
-    prewarm_enabled: true
-    prewarm_passes: 2
+  # Local slot lifecycle / SAM3 refresh continuity.
+  release_after_missing_frames: 30
+  local_slot_iou_threshold: 0.05
 
   efficient_tam:
     checkpoint: checkpoints/efficienttam_s_512x512.pt
     config: configs/efficienttam/efficienttam_s_512x512.yaml
     non_overlap_masks: false
 
-    # Main switch requested for the integration.
-    # sequential  -> per-view encoder + per-object B=1 propagation (old compute)
+    # sequential  -> batched B=num_views feature snapshot + per-object B=1 propagation
     # fixed_batch -> one B=num_views encoder + one fixed all-view/object batch
-    execution_mode: fixed_batch # sequential | fixed_batch
+    execution_mode: fixed_batch
 
-    # fixed_num_views is derived automatically from runtime.camera_names.
-    # With two cameras and max_objects_per_view=3, fixed_batch uses B=6.
-    max_objects_per_view: 3
+    # Slot count is derived directly from the capacities in detector.prompts.
+    # Compile optimization defaults to torch.compile(mode="default").
+    # Set true only when explicitly benchmarking max-autotune.
+    use_max_autotune: false
 
-    # Compile/capture the actual multi-view shape before live diagnostics start.
+    # Persistent EfficientTAM image-feature ring used by asynchronous SAM3
+    # corrected-reference inference. With 2 views this is ~4 MiB/frame for the
+    # current EfficientTAM-S model, so 32 frames is ~128 MiB. The raw normalized
+    # image store is also bounded and is automatically kept at least 2 frames
+    # larger than this history.
+    feature_history_frames: 32
+
+    # Prewarm normal cached-feature propagation plus the direct-correction path.
     prewarm_enabled: true
     prewarm_temporal_frames: 20
     prewarm_post_reset_frames: 2
     prewarm_passes: 2
 
-association:
-  max_centroid_distance_m: 0.35
-  min_mask_iou: 0.05
-  weight_centroid: 2.0
-  weight_iou: 1.0
-  weight_depth: 0.5
-  weight_embedding: 0.35
-  label_mismatch_cost: 10.0
-  lost_ttl_frames: 45
-
 postprocess:
   mask_threshold: 0.0
-  overlap_depth_only: false
-  depth_model_min_pixels: 40
-  depth_gate_mad_scale: 4.0
-  depth_gate_min_m: 0.035
-  depth_gate_max_m: 0.25
-  logit_weight: 0.15
-  erosion_pixels: 2
-  depth_edge_threshold_m: 0.04
+  erosion_pixels: 0
   min_component_pixels: 30
   min_valid_depth_m: 0.10
   max_valid_depth_m: 6.0
-  visible_ratio_visible: 0.60
-  visible_ratio_partial: 0.15
 
-pointcloud:
-  stride: 1
-  max_points_per_instance: 30000
-  transform_to_world: true
+# Same-time, different-camera geometry alignment. World voxels are sparse keys;
+# no dense 3-D volume is allocated.
+shared_voxel_grid:
+  voxel_size_m: 0.01
+  origin_world: [0.0, 0.0, 0.0]
+  match_radius_voxels: 1
+  min_alignment_score: 0.15
+  min_bidirectional_coverage: 0.20
+  # Optional bounded per-object local occupancy acceleration; never a global grid.
+  max_local_dense_voxels: 1000000
+
+# Different-time alignment: class+centroid hard gate -> batched GPU Chamfer ->
+# Hungarian. Cross-view output is voxel-deduplicated once more on the same
+# shared_voxel_grid lattice before Chamfer, removing overlapping view samples.
+cross_frame_alignment:
+  centroid_gate_m: 0.20
+  chamfer_max_workspace_mb: 512
+  # Optional safety threshold; leave unset until measured on your scene.
+  # max_chamfer_m: 0.08
 
 profiling:
   enabled: true

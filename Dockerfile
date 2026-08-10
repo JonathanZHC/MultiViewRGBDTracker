@@ -1,9 +1,10 @@
 # syntax=docker/dockerfile:1.7
-# Self-contained Isaac Sim 6.0.1 + ROS 2 Jazzy + SAM3 tracking image.
+
+# Self-contained Isaac Sim 6.0.1 + ROS 2 Jazzy + SAM3 + EfficientTAM tracking image.
 #
 # Runtime separation is deliberate:
-#   Isaac scene: /isaac-sim/python.sh
-#   Tracking:    /opt/tracking-venv/bin/python
+# Isaac scene: /isaac-sim/python.sh
+# Tracking:    /opt/tracking-venv/bin/python
 #
 # The tracking virtualenv is never activated globally and is never added to
 # Isaac Sim's PYTHONPATH. This prevents NumPy/SciPy/package collisions.
@@ -21,10 +22,10 @@ ARG TRACKING_TORCH_VERSION=2.8.0
 ARG TRACKING_TORCHVISION_VERSION=0.23.0
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
 ARG WARP_VERSION=1.15.0
+
 ARG SAM3_REPOSITORY=https://github.com/facebookresearch/sam3.git
 ARG SAM3_REF=main
-ARG SAM_MT_REPOSITORY=https://github.com/FudanCVL/SAM-MT.git
-ARG SAM_MT_REF=main
+
 ARG EFFICIENT_TAM_REPOSITORY=https://github.com/JonathanZHC/EfficientTAM.git
 ARG EFFICIENT_TAM_REF=main
 
@@ -49,8 +50,9 @@ ENV LANG=en_US.UTF-8 \
     MPLCONFIGDIR=/isaac-sim/.cache/matplotlib
 
 # -----------------------------------------------------------------------------
-# ScenePredictor/YOLOE-style Isaac + ROS runtime dependencies.
+# Isaac + ROS runtime dependencies.
 # -----------------------------------------------------------------------------
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git git-lfs gnupg2 locales lsb-release \
       software-properties-common \
@@ -83,8 +85,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && git lfs install --system \
     && rm -rf /var/lib/apt/lists/*
 
-# Isaac-side GPU packages used by the copied ScenePredictor isaacscene code.
-# Keep these isolated from the tracking venv, exactly as separate processes.
+# -----------------------------------------------------------------------------
+# Isaac-side GPU packages used by the scene/sensor publisher.
+# Keep these isolated from the tracking venv because they run in separate
+# processes and may require different Torch/package versions.
+# -----------------------------------------------------------------------------
+
 RUN mkdir -p /opt/isaac-python-packages \
     && /isaac-sim/python.sh -m pip install --no-cache-dir \
       --target /opt/isaac-python-packages \
@@ -105,6 +111,7 @@ import site
 site_dirs = site.getsitepackages()
 if not site_dirs:
     raise RuntimeError("Isaac Sim site-packages directory was not found")
+
 pth = Path(site_dirs[0]) / "sam_rgbd_isaac_paths.pth"
 pth.write_text(
     "import sys; "
@@ -116,67 +123,73 @@ print("created", pth)
 PY
 
 # -----------------------------------------------------------------------------
-# Isolated tracking environment: SAM3 + SAM-MT + EfficientTAM.
+# Isolated tracking environment: SAM3 + EfficientTAM.
 # -----------------------------------------------------------------------------
+
 RUN python3.12 -m venv /opt/tracking-venv \
     && /opt/tracking-venv/bin/python -m pip install --no-cache-dir --upgrade pip \
     && /opt/tracking-venv/bin/python -m pip install --no-cache-dir \
-       "setuptools>=75,<81" "wheel>=0.45,<1" \
+      "setuptools>=75,<81" "wheel>=0.45,<1" \
     && /opt/tracking-venv/bin/python -m pip install --no-cache-dir \
-       torch==${TRACKING_TORCH_VERSION} \
-       torchvision==${TRACKING_TORCHVISION_VERSION} \
-       --index-url ${TORCH_INDEX_URL} \
+      torch==${TRACKING_TORCH_VERSION} \
+      torchvision==${TRACKING_TORCHVISION_VERSION} \
+      --index-url ${TORCH_INDEX_URL} \
     && /opt/tracking-venv/bin/python -m pip install --no-cache-dir \
-       "numpy>=1.26,<2" \
-       "scipy>=1.12,<2" \
-       "pandas>=2.2,<3" \
-       "opencv-python-headless>=4.9,<4.12" \
-       "Pillow>=10,<12" \
-       "PyYAML>=6,<7" \
-       "tqdm>=4.66" \
-       "psutil>=5.9" \
-       "hydra-core>=1.3.2,<1.4" \
-       "omegaconf>=2.3,<2.4" \
-       "huggingface-hub>=0.27,<2" \
-       "safetensors>=0.4" \
-       "transformers>=4.48,<5" \
-       "accelerate>=1,<2" \
-       "timm>=1.0.17" \
-       "ftfy==6.1.1" regex \
-       "iopath>=0.1.10" \
-       "portalocker>=2.10" \
-       "einops>=0.8" \
-       ninja \
-       "matplotlib>=3.9" \
-       "typing_extensions>=4.12" \
-       "pycocotools>=2.0.8,<3" \
-       "decord==0.6.0" \
-       "scikit-image>=0.24" \
-       "scikit-learn>=1.5"
+      "numpy>=1.26,<2" \
+      "scipy>=1.12,<2" \
+      "pandas>=2.2,<3" \
+      "opencv-python-headless>=4.9,<4.12" \
+      "Pillow>=10,<12" \
+      "PyYAML>=6,<7" \
+      "tqdm>=4.66" \
+      "psutil>=5.9" \
+      "hydra-core>=1.3.2,<1.4" \
+      "omegaconf>=2.3,<2.4" \
+      "huggingface-hub>=0.27,<2" \
+      "safetensors>=0.4" \
+      "transformers>=4.48,<5" \
+      "accelerate>=1,<2" \
+      "timm>=1.0.17" \
+      "ftfy==6.1.1" regex \
+      "iopath>=0.1.10" \
+      "portalocker>=2.10" \
+      "einops>=0.8" \
+      ninja \
+      "matplotlib>=3.9" \
+      "typing_extensions>=4.12" \
+      "pycocotools>=2.0.8,<3" \
+      "decord==0.6.0" \
+      "scikit-image>=0.24" \
+      "scikit-learn>=1.5"
+
+# -----------------------------------------------------------------------------
+# Upstream model repositories.
+# -----------------------------------------------------------------------------
 
 RUN mkdir -p /opt/upstream \
     && git clone "${SAM3_REPOSITORY}" /opt/upstream/sam3 \
     && git -C /opt/upstream/sam3 checkout "${SAM3_REF}" \
     && git -C /opt/upstream/sam3 submodule update --init --recursive \
-    && git clone "${SAM_MT_REPOSITORY}" /opt/upstream/sam-mt \
-    && git -C /opt/upstream/sam-mt checkout "${SAM_MT_REF}" \
-    && git -C /opt/upstream/sam-mt submodule update --init --recursive \
     && git clone "${EFFICIENT_TAM_REPOSITORY}" /opt/upstream/efficient-tam \
     && git -C /opt/upstream/efficient-tam checkout "${EFFICIENT_TAM_REF}" \
     && git -C /opt/upstream/efficient-tam submodule update --init --recursive \
     && /opt/tracking-venv/bin/python -m pip install --no-cache-dir --no-deps -e /opt/upstream/sam3
 
-# ROS Python bindings + upstream model repos + the bind-mounted repository.
+# ROS Python bindings + upstream model repos + bind-mounted benchmark repository.
 RUN printf '%s\n' \
       '/opt/ros/jazzy/lib/python3.12/site-packages' \
       '/usr/lib/python3/dist-packages' \
       '/opt/upstream/sam3' \
-      '/opt/upstream/sam-mt' \
       '/opt/upstream/efficient-tam' \
       '/workspace' \
       > /opt/tracking-venv/lib/python3.12/site-packages/sam_rgbd_tracking_paths.pth
 
-# Catch dependency problems such as the matplotlib/SAM-MT failure at build time.
+# -----------------------------------------------------------------------------
+# Build-time dependency/API smoke test.
+# This verifies package compatibility and confirms that the EfficientTAM
+# checkout contains the direct-reference API required by the benchmark.
+# -----------------------------------------------------------------------------
+
 RUN source /opt/ros/jazzy/setup.bash \
     && /opt/tracking-venv/bin/python - <<'PY'
 import cv2
@@ -185,38 +198,70 @@ import numpy
 import rclpy
 import torch
 import sam3
-import sam2
 import efficient_track_anything
+
 from cv_bridge import CvBridge
 from sam3.model_builder import build_sam3_image_model
-from sam2.build_sam import build_sam2_video_predictor
-from efficient_track_anything.build_efficienttam import build_efficienttam_video_predictor
+from efficient_track_anything.build_efficienttam import (
+    build_efficienttam_video_predictor,
+)
+from efficient_track_anything.efficienttam_video_predictor import (
+    EfficientTAMVideoPredictor,
+)
+
+required_direct_reference_apis = (
+    "snapshot_multiview_image_features",
+    "correct_multiview_from_reference",
+)
+
+missing = [
+    name
+    for name in required_direct_reference_apis
+    if not hasattr(EfficientTAMVideoPredictor, name)
+]
+
+if missing:
+    raise RuntimeError(
+        "EfficientTAM checkout is missing required direct-reference API(s): "
+        f"{missing}"
+    )
+
 print("tracking dependencies OK")
 print("torch", torch.__version__, "cuda", torch.version.cuda)
 print("numpy", numpy.__version__, "opencv", cv2.__version__)
 print("matplotlib", matplotlib.__version__)
 print("ROS", rclpy.__file__, "CvBridge", CvBridge.__name__)
 print("SAM3", build_sam3_image_model)
-print("SAM-MT", build_sam2_video_predictor)
 print("EfficientTAM", build_efficienttam_video_predictor)
+print("EfficientTAM direct-reference APIs OK")
 PY
 
-# Simple common entrypoint: source ROS only. Do not activate the tracking venv.
+# -----------------------------------------------------------------------------
+# Common entrypoint: source ROS only. Do not activate the tracking venv.
+# -----------------------------------------------------------------------------
+
 RUN cat > /usr/local/bin/sam-rgbd-entrypoint <<'EOF_ENTRYPOINT'
 #!/usr/bin/env bash
 set -euo pipefail
+
 if [[ -f /opt/ros/jazzy/setup.bash ]]; then
     set +u
     source /opt/ros/jazzy/setup.bash
     set -u
 fi
+
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-117}"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
+
 exec "$@"
 EOF_ENTRYPOINT
+
 RUN chmod +x /usr/local/bin/sam-rgbd-entrypoint
 
+# -----------------------------------------------------------------------------
 # Runtime/cache directories use the Isaac image's normal UID/GID 1234.
+# -----------------------------------------------------------------------------
+
 RUN install -d -o 1234 -g 1234 -m 0775 \
       /workspace \
       /workspace/checkpoints \
@@ -235,5 +280,6 @@ RUN install -d -o 1234 -g 1234 -m 0775 \
 
 USER 1234:1234
 WORKDIR /workspace
+
 ENTRYPOINT ["/usr/local/bin/sam-rgbd-entrypoint"]
 CMD ["/bin/bash"]

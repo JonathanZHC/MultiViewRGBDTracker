@@ -26,31 +26,49 @@ class FrameProfiler:
 
     PREFERRED_ORDER = [
         "pipeline_total",
-        "postprocess_cpu",
-        "sam3_total_gpu",
-        "tracker_call_wall_cpu",
-        "tracker_total_wall_cpu",
-        "tracker_lock_wait_cpu",
-        "tracker_first_init_cpu",
-        "tracker_reinit_wall_cpu",
-        "tracker_reinit_gpu",
-        "tracker_stream_reset_cpu",
-        "tracker_seed_gpu",
-        "tracker_append_cpu",
-        "tracker_input_host_copy_cpu",
-        "tracker_input_preprocess_gpu",
-        "tracker_buffer_grow_gpu",
-        "tracker_buffer_grow_cpu",
-        "tracker_propagate_gpu",
-        "tracker_state_clone_gpu",
-        "tracker_output_d2h_cpu",
-        "tracker_total_gpu",
+        "sam3_filter",
+        "sam3_slot_assoc",
+        "sam3_async",
+        "tracker_reinit",
+        "tracker_propagate",
+        "tracker_direct_correction",
+        "postprocess_alignment_total",
+        "postprocess_total",
+        "postprocess_masks",
+        "postprocess_components",
+        "postprocess_geometry",
+        "postprocess_finalize",
+        "alignment_total",
+        "cross_view_voxelize",
+        "cross_view_bbox_gate",
+        "cross_view_voxel_match",
+        "cross_view_hungarian",
+        "cross_view_fusion",
+        "cross_view_total",
+        "cross_frame_gate",
+        "cross_frame_chamfer",
+        "cross_frame_hungarian",
+        "cross_frame_total",
     ]
 
-    def __init__(self, config, name: str = "tracking") -> None:
+    def __init__(
+        self,
+        config,
+        name: str = "tracking",
+        *,
+        auto_print: bool = True,
+    ) -> None:
         self.name = name
+        self.auto_print = bool(auto_print)
         self.enabled = bool(config.profiling.get("enabled", True))
         self.interval = int(config.profiling.get("summary_interval_frames", 100))
+        # The ROS rate report already prints the same batched stage statistics in
+        # a compact rolling window. Avoid a second periodic profiler dump; a final
+        # cumulative profiler summary is still printed on shutdown.
+        if name == "batched_pipeline" and bool(
+            config.profiling.get("rate_diagnostics", True)
+        ):
+            self.interval = 0
         self.use_cuda_events = bool(config.profiling.get("cuda_events", True))
         raw_csv = str(config.profiling.get("csv_path", ""))
         self.csv_path = Path(raw_csv) if raw_csv else None
@@ -139,7 +157,11 @@ class FrameProfiler:
             self.last_frame = timings
             if self.csv_path is not None:
                 self._append_csv(self._frames, timings)
-            if self.interval > 0 and self._frames % self.interval == 0:
+            if (
+                self.auto_print
+                and self.interval > 0
+                and self._frames % self.interval == 0
+            ):
                 self.print_summary()
         return timings
 
@@ -182,7 +204,12 @@ class FrameProfiler:
     def print_summary(self) -> None:
         if not self.enabled or self._frames == 0:
             return
-        print(f"[Profiler:{self.name}] frames={self._frames}", flush=True)
+        lines = [
+            f"[Profiler:{self.name}] frames={self._frames}",
+            "  "
+            f"{'stage':<36} {'n':>6} {'mean':>8} {'median':>8} "
+            f"{'p95':>8} {'max':>8} {'worst':>7}",
+        ]
         keys = self.PREFERRED_ORDER + sorted(
             key for key in self._history if key not in self.PREFERRED_ORDER
         )
@@ -193,12 +220,12 @@ class FrameProfiler:
             mean, median, p95, maximum, max_index = self._summary(values)
             frames = self._history_frames.get(key, [])
             worst_frame = frames[max_index] if max_index < len(frames) else -1
-            print(
-                f"  {key}: n={len(values)}, mean={mean:.2f} ms, "
-                f"median={median:.2f} ms, p95={p95:.2f} ms, "
-                f"max={maximum:.2f} ms (frame={worst_frame})",
-                flush=True,
+            lines.append(
+                "  "
+                f"{key:<36} {len(values):>6d} {mean:>8.2f} {median:>8.2f} "
+                f"{p95:>8.2f} {maximum:>8.2f} {worst_frame:>7d}"
             )
+        print("\n".join(lines), flush=True)
 
     @property
     def frames(self) -> int:

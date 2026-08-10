@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from functools import lru_cache
+
 import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
@@ -117,11 +119,12 @@ def transform_points(points: np.ndarray, transform: np.ndarray | None) -> np.nda
         return None
     if points.size == 0:
         return np.empty((0, 3), dtype=np.float32)
-    hom = np.concatenate(
-        (points, np.ones((points.shape[0], 1), dtype=np.float32)),
-        axis=1,
-    )
-    return (hom @ transform.T)[:, :3].astype(np.float32)
+    # Rigid xyz transform without constructing an Nx4 homogeneous temporary.
+    # This is on the per-instance postprocess hot path.
+    transform = np.asarray(transform, dtype=np.float32)
+    return (
+        points @ transform[:3, :3].T + transform[:3, 3][None, :]
+    ).astype(np.float32, copy=False)
 
 
 def bbox_3d(points: np.ndarray | None) -> tuple[np.ndarray | None, np.ndarray | None]:
@@ -133,25 +136,90 @@ def bbox_3d(points: np.ndarray | None) -> tuple[np.ndarray | None, np.ndarray | 
     )
 
 
+@lru_cache(maxsize=16)
+def _erosion_kernel(erosion_pixels: int) -> np.ndarray:
+    """Cache the tiny morphology kernels instead of allocating per mask/frame."""
+    radius = max(0, int(erosion_pixels))
+    size = 2 * radius + 1
+    return np.ones((size, size), dtype=np.uint8)
+
+
+def erode_filter_and_bbox(
+    mask: np.ndarray,
+    erosion_pixels: int,
+    min_component_pixels: int,
+) -> tuple[np.ndarray, tuple[int, int, int, int] | None]:
+    """Pure 2-D morphology plus an already-computed 2-D bbox.
+
+    The connected-component pass already computes component extents, so reuse
+    those statistics for visualization rather than rescanning each final mask
+    later in the RViz stage.  Component selection is LUT/vectorized instead of
+    repeatedly evaluating ``labels == index`` in Python.
+    """
+    out = np.asarray(mask, dtype=np.uint8)
+    if erosion_pixels > 0 and np.any(out):
+        out = cv2.erode(
+            out,
+            _erosion_kernel(int(erosion_pixels)),
+            iterations=1,
+        )
+
+    bbox: tuple[int, int, int, int] | None = None
+    if min_component_pixels > 1 and np.any(out):
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            out,
+            connectivity=8,
+        )
+        if count > 1:
+            component_ids = np.arange(1, count, dtype=np.int32)
+            valid = component_ids[
+                stats[1:, cv2.CC_STAT_AREA] >= int(min_component_pixels)
+            ]
+            if valid.size:
+                keep_lut = np.zeros(count, dtype=bool)
+                keep_lut[valid] = True
+                filtered = keep_lut[labels]
+
+                valid_stats = stats[valid]
+                x0 = int(valid_stats[:, cv2.CC_STAT_LEFT].min())
+                y0 = int(valid_stats[:, cv2.CC_STAT_TOP].min())
+                x1 = int(
+                    (
+                        valid_stats[:, cv2.CC_STAT_LEFT]
+                        + valid_stats[:, cv2.CC_STAT_WIDTH]
+                        - 1
+                    ).max()
+                )
+                y1 = int(
+                    (
+                        valid_stats[:, cv2.CC_STAT_TOP]
+                        + valid_stats[:, cv2.CC_STAT_HEIGHT]
+                        - 1
+                    ).max()
+                )
+                bbox = (x0, y0, x1, y1)
+                return filtered, bbox
+        return np.zeros_like(out, dtype=bool), None
+
+    out_bool = out.astype(bool, copy=False)
+    if np.any(out_bool):
+        x, y, width, height = cv2.boundingRect(out)
+        bbox = (int(x), int(y), int(x + width - 1), int(y + height - 1))
+    return out_bool, bbox
+
+
 def erode_and_filter(
     mask: np.ndarray,
     erosion_pixels: int,
     min_component_pixels: int,
 ) -> np.ndarray:
-    """Pure 2-D morphology; no depth information is used."""
-    out = mask.astype(np.uint8)
-    if erosion_pixels > 0 and out.any():
-        size = 2 * erosion_pixels + 1
-        kernel = np.ones((size, size), dtype=np.uint8)
-        out = cv2.erode(out, kernel, iterations=1)
-    if min_component_pixels > 1 and out.any():
-        count, labels, stats, _ = cv2.connectedComponentsWithStats(out, connectivity=8)
-        keep = np.zeros_like(out, dtype=np.uint8)
-        for index in range(1, count):
-            if int(stats[index, cv2.CC_STAT_AREA]) >= min_component_pixels:
-                keep[labels == index] = 1
-        out = keep
-    return out.astype(bool)
+    """Compatibility wrapper returning only the filtered mask."""
+    filtered, _ = erode_filter_and_bbox(
+        mask,
+        erosion_pixels,
+        min_component_pixels,
+    )
+    return filtered
 
 
 def nonoverlap_owner_map(

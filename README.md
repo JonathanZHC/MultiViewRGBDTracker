@@ -287,16 +287,8 @@ docker exec -it sam-rgbd-tracking bash -lc '
 
 Open terminal 2.
 
-### SAM-MT
-
 ```bash
-./scripts/run_tracking.sh sam_mt
-```
-
-### EfficientTAM
-
-```bash
-./scripts/run_tracking.sh efficient_tam
+./scripts/run_tracking.sh
 ```
 
 Both backends use the same higher-level pipeline:
@@ -325,6 +317,12 @@ Open terminal 3:
 
 ```bash
 ./scripts/run_rviz.sh
+```
+
+```bash
+touch rviz/tracking.rviz
+sudo setfacl -m u:1234:rw rviz/tracking.rviz
+sudo setfacl -m u:1234:rwx .
 ```
 
 The tracking RViz config shows, for both cameras:

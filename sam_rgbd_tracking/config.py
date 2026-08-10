@@ -30,15 +30,10 @@ class Config:
 def load_config(
     path: str | Path,
     *,
-    tracker: str | None = None,
     efficient_tam_execution_mode: str | None = None,
 ) -> Config:
     with Path(path).open("r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle) or {}
-
-    tracker_cfg = data.setdefault("tracker", {})
-    if tracker is not None:
-        tracker_cfg["backend"] = tracker
 
     if efficient_tam_execution_mode is not None:
         mode = str(efficient_tam_execution_mode).strip().lower()
@@ -47,6 +42,8 @@ def load_config(
                 "efficient_tam_execution_mode must be 'sequential' or "
                 f"'fixed_batch', got {efficient_tam_execution_mode!r}"
             )
-        tracker_cfg.setdefault("efficient_tam", {})["execution_mode"] = mode
+        data.setdefault("tracker", {}).setdefault("efficient_tam", {})[
+            "execution_mode"
+        ] = mode
 
     return Config(data)

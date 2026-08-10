@@ -1,31 +1,90 @@
 # sam_rgbd_tracking
 
-Minimal SAM3 + mask-tracking RGB-D package used by `SAMTrackingRGBDBenchmark`.
+EfficientTAM-only multi-camera RGB-D tracking package used by `SAMTrackingRGBDBenchmark`.
 
-## Runtime paths
+## Runtime architecture
 
-- `sam_mt`: one tracker per camera.
-- `efficient_tam`: one shared multi-view EfficientTAM predictor.
-  - `execution_mode=sequential`: per-view encoder + per-object B=1 propagation.
-  - `execution_mode=fixed_batch`: all views encoded together and all fixed object slots propagated in one batch.
+There is one shared multi-view EfficientTAM tracker and one sparse asynchronous SAM3 worker.
 
-For fixed batching, `max_objects_per_view` is the fixed per-view slot count. Missing objects use dummy slots internally; dummy outputs are removed before the per-camera results are returned.
+- EfficientTAM runs continuously on every synchronized camera bundle.
+- `fixed_batch`: one image encoder batch `B=num_views`, then one fixed object-slot batch.
+- `sequential`: the image-feature snapshot is still batched across views, while object propagation remains B=1 per object.
+- Every EfficientTAM frame stores a persistent image-feature snapshot in a bounded GPU ring.
+- SAM3 runs on a separate persistent thread/CUDA stream and accepts all synchronized camera RGBs in one batch.
+- Only one SAM3 job may be outstanding; new triggers are skipped while SAM3 is busy.
+- When SAM3 result for historical frame `x` arrives, the next tracker frame `t` uses direct corrected-reference inference: `feature[x] + SAM3 mask[x] + feature[t] -> mask[t]`.
+- No intermediate `x+1...t-1` replay is performed.
+- After correction, the next frame returns to ordinary EfficientTAM propagation with the same output interface.
 
-## Multi-view behavior
+The first SAM3 inference is the only blocking detector call because no tracker state exists yet.
 
-Each camera keeps independent SAM3 detection, association, RGB-D post-processing, point clouds, TF use, RViz output, and ROS topics. EfficientTAM propagation is shared across the synchronized camera bundle.
+## Object topology
 
-Keyframes are coordinated across all views. Any initial, periodic, or tracking-anomaly refresh resets/reseeds every EfficientTAM view together before propagation resumes. This keeps temporal memory aligned for fixed batching.
+Per-class tracker capacity is configured next to each SAM3 semantic prompt:
 
-## Startup logging
+```yaml
+detector:
+  prompts:
+    - [ball, 2]
+    - [red and white can, 1]
+    - [mustard bottle, 1]
+```
 
-Normal tracking suppresses periodic RGB-D/rate diagnostics during model initialization and pre-warm. Startup only prints short stage messages. After the first successful tracking bundle, a single `tracking LIVE` message is printed and periodic live diagnostics resume.
+The capacities sum to the fixed EfficientTAM slot count per view. Inactive slots
+remain reserved, so SAM3 can activate a newly observed same-class instance without
+changing the batch shape or recompiling EfficientTAM. Older configs with plain
+string prompts plus `max_instances_per_class` are still accepted.
 
-`--camera-only` is intentionally different: it prints camera diagnostics immediately because its purpose is transport debugging.
+## Multi-view / temporal alignment
 
-## Important runtime protections
+Cross-view alignment uses the shared sparse world voxel lattice, Hungarian matching,
+and keeps unmatched single-view observations. After grouping, the final fused point
+cloud is voxel-deduplicated on that **same** lattice by reusing the voxel keys already
+computed for matching. This removes repeated samples in overlapping camera regions
+without a second quantization pass. The resulting fused/downsampled point cloud is
+then used by cross-frame class+centroid gating, batched GPU Chamfer, and Hungarian
+assignment.
 
-- EfficientTAM model construction, pre-warm, correction, and propagation run on one persistent GPU-owner thread for TorchInductor/CUDAGraph safety.
-- The EfficientTAM memory-attention output clone boundary is retained to avoid CUDAGraph output overwrite.
-- Optional hole filling is disabled automatically when the EfficientTAM `_C` extension is unavailable.
-- Multi-view propagation is allowed only after reset -> seed -> `prepare_multiview_states()` completes successfully.
+## Feature cache
+
+`tracker.efficient_tam.feature_history_frames` controls the persistent feature ring. If a SAM3 result arrives after its reference feature has expired, the result is dropped and normal propagation continues.
+
+## Startup
+
+EfficientTAM prewarm now covers:
+
+1. normal `encode + persistent snapshot + propagation`,
+2. corrected-reference direct inference,
+3. one normal propagation after correction.
+
+Normal rate diagnostics stay quiet until the first successful initialized tracking bundle. `--camera-only` still reports transport diagnostics immediately.
+
+## Batched post-processing
+
+The multi-view EfficientTAM path uses one `BatchedPostprocessor` for the complete
+synchronized camera bundle. Active `view x instance` slots are flattened into one
+work batch:
+
+1. mask resize + threshold + erosion: one CUDA tensor batch when
+   `postprocess.gpu_batch: true` and CUDA is available; otherwise one persistent
+   CPU task batch,
+2. connected components: per-instance OpenCV operation, but restricted to the
+   nonzero ROI and executed concurrently in the persistent worker pool,
+3. RGB-D geometry: one stacked-mask nonzero pass per image shape, stride is applied
+   before nonzero, camera rays are cached, depth validity is checked once, then
+   backprojection/world transforms are vectorized by view,
+4. finalize: visualization-only RGB gathers, local centroids/bounds, owner maps and
+   debug rasters are skipped when visualization is disabled.
+
+Optional tuning knobs:
+
+```yaml
+postprocess:
+  gpu_batch: true   # dense mask resize/threshold/erosion on CUDA
+  cpu_workers: 0    # 0 = auto, capped at 8 workers
+```
+
+Sparse cross-view voxel matching/Hungarian stay on CPU because their measured
+matrices/clouds are small; cross-frame Chamfer stays batched on CUDA. The runtime
+prints one `[Rate:batch]` / `[Profiler:batched_pipeline]` report for each synchronized
+multi-camera pipeline instead of duplicating the same compute time per camera.

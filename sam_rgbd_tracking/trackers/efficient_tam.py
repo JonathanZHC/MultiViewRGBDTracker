@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import OrderedDict
 from contextlib import nullcontext
 from typing import Any, ClassVar
 
@@ -158,7 +159,10 @@ class EfficientTAMTracker(Sam2StyleStreamingTracker):
         prewarm_passes: int = 2,
         execution_mode: str = "sequential",
         fixed_num_views: int = 2,
-        max_objects_per_view: int = 4,
+        object_slots_per_view: int = 4,
+        slot_layout_key: tuple[str, ...] | list[str] = (),
+        feature_history_frames: int = 32,
+        use_max_autotune: bool = False,
         **kwargs: Any,
     ) -> None:
         self.execution_mode = str(execution_mode).strip().lower()
@@ -168,7 +172,10 @@ class EfficientTAMTracker(Sam2StyleStreamingTracker):
                 "use 'sequential' or 'fixed_batch'."
             )
         self.fixed_num_views = max(1, int(fixed_num_views))
-        self.max_objects_per_view = max(1, int(max_objects_per_view))
+        self.object_slots_per_view = max(1, int(object_slots_per_view))
+        self.slot_layout_key = tuple(str(value) for value in slot_layout_key)
+        self.feature_history_frames = max(2, int(feature_history_frames))
+        self.use_max_autotune = bool(use_max_autotune)
         self.prewarm_enabled = bool(prewarm_enabled)
         cleaned = sorted({max(1, int(value)) for value in prewarm_object_counts})
         self.prewarm_object_counts = tuple(cleaned or [1])
@@ -176,6 +183,13 @@ class EfficientTAMTracker(Sam2StyleStreamingTracker):
         self.prewarm_post_reset_frames = max(1, int(prewarm_post_reset_frames))
         self.prewarm_passes = max(1, int(prewarm_passes))
         super().__init__(*args, **kwargs)
+        # Raw model-input images use a fixed physical ring. Keep it slightly
+        # larger than the persistent feature ring so every cached reference
+        # remains addressable by logical frame index, including sequential mode.
+        self.stream_buffer_frames = max(
+            self.stream_buffer_frames,
+            self.feature_history_frames + 2,
+        )
 
     @property
     def backend_name(self) -> str:
@@ -185,7 +199,10 @@ class EfficientTAMTracker(Sam2StyleStreamingTracker):
         return super()._cache_key() + (
             self.execution_mode,
             str(self.fixed_num_views),
-            str(self.max_objects_per_view),
+            str(self.object_slots_per_view),
+            *self.slot_layout_key,
+            str(self.feature_history_frames),
+            str(self.use_max_autotune),
         )
 
     def _build_predictor(self) -> Any:
@@ -202,7 +219,8 @@ class EfficientTAMTracker(Sam2StyleStreamingTracker):
             vos_optimized=self.vos_optimized,
             execution_mode=self.execution_mode,
             fixed_num_views=self.fixed_num_views,
-            max_objects_per_view=self.max_objects_per_view,
+            max_objects_per_view=self.object_slots_per_view,
+            use_max_autotune=self.use_max_autotune,
         )
 
         _move_rope_frequency_caches_to_device(predictor, self.device)
@@ -464,6 +482,37 @@ class EfficientTAMMultiViewTracker(EfficientTAMTracker):
             [] for _ in range(self.num_views)
         ]
         self._live_prepared = False
+        self._feature_snapshots: OrderedDict[int, dict[str, Any]] = OrderedDict()
+
+        required_api = (
+            "snapshot_multiview_image_features",
+            "correct_multiview_from_reference",
+        )
+        missing = [name for name in required_api if not hasattr(self.predictor, name)]
+        if missing:
+            raise RuntimeError(
+                "EfficientTAM checkout is missing the asynchronous direct-reference "
+                f"API: {missing}. Rebuild the container from the updated EfficientTAM repo."
+            )
+
+    def _live_states(self) -> list[dict[str, Any]]:
+        if any(stream is None for stream in self.streams):
+            raise RuntimeError("EfficientTAM multi-view streams are not initialized")
+        return [stream.state for stream in self.streams if stream is not None]
+
+    def _cache_feature_snapshot(self, snapshot: dict[str, Any]) -> None:
+        frame_idx = int(snapshot["frame_idx"])
+        self._feature_snapshots[frame_idx] = snapshot
+        self._feature_snapshots.move_to_end(frame_idx)
+        while len(self._feature_snapshots) > self.feature_history_frames:
+            self._feature_snapshots.popitem(last=False)
+
+    def has_feature_snapshot(self, frame_idx: int) -> bool:
+        return int(frame_idx) in self._feature_snapshots
+
+    @property
+    def cached_feature_frames(self) -> tuple[int, ...]:
+        return tuple(self._feature_snapshots.keys())
 
     def _state_prepared(self, state: dict[str, Any]) -> bool:
         if not bool(state.get("multiview_prepared", False)):
@@ -546,6 +595,7 @@ class EfficientTAMMultiViewTracker(EfficientTAMTracker):
             raise ValueError(f"Expected {self.num_views} RGB views, got {len(rgbs)}")
 
         self._live_prepared = False
+        self._feature_snapshots.clear()
         for view_idx, rgb in enumerate(rgbs):
             stream = self.streams[view_idx]
             if stream is None:
@@ -562,17 +612,49 @@ class EfficientTAMMultiViewTracker(EfficientTAMTracker):
         self,
         result: dict[str, Any],
     ) -> TrackerPrediction:
-        masks = self._to_numpy_logits(result["video_res_masks"])
+        """Keep live mask logits on CUDA for the batched postprocessor.
+
+        EfficientTAM already produced these logits on the GPU.  The old adapter
+        copied the full O×H×W tensor to CPU only for postprocess to immediately
+        copy it back to CUDA for resize/threshold/erosion.  Keep the tensor on
+        device and transfer only the tiny presence vector plus compact masks later.
+        """
+        value = result["video_res_masks"]
+        if torch is not None and torch.is_tensor(value):
+            masks = value.detach()
+            if masks.ndim == 4 and masks.shape[1] == 1:
+                masks = masks[:, 0]
+            if masks.ndim == 4 and masks.shape[0] == 1:
+                masks = masks[0]
+            if masks.ndim == 2:
+                masks = masks[None]
+            if masks.ndim != 3:
+                raise ValueError(
+                    f"Unexpected EfficientTAM mask shape: {tuple(masks.shape)}"
+                )
+            # Presence is a tiny O-vector; computing it on device avoids a full
+            # logits D2H while preserving the existing heuristic exactly.
+            flat = masks.float().reshape(masks.shape[0], -1)
+            positive_fraction = (flat > 0).float().mean(dim=1)
+            peak = flat.amax(dim=1)
+            presence = (
+                torch.sigmoid(peak.clamp(-20.0, 20.0))
+                * (positive_fraction * 20.0).clamp(0.0, 1.0)
+            ).cpu().numpy().astype(np.float32, copy=False)
+        else:
+            masks = self._to_numpy_logits(value)
+            presence = self._presence_from_logits(masks)
+
         track_ids = [int(value) for value in result.get("obj_ids", [])]
-        if len(track_ids) != masks.shape[0]:
+        if len(track_ids) != int(masks.shape[0]):
             raise RuntimeError(
                 "EfficientTAM output ID/mask count mismatch: "
-                f"ids={len(track_ids)} masks={masks.shape[0]}"
+                f"ids={len(track_ids)} masks={int(masks.shape[0])}"
             )
         return TrackerPrediction(
             track_ids,
             masks,
-            self._presence_from_logits(masks),
+            presence,
             {
                 "backend": self.backend_name,
                 "execution_mode": self.execution_mode,
@@ -645,10 +727,10 @@ class EfficientTAMMultiViewTracker(EfficientTAMTracker):
             )
         if self.execution_mode == "fixed_batch":
             for view_idx, seeds in enumerate(seeds_per_view):
-                if len(seeds) > self.max_objects_per_view:
+                if len(seeds) != self.object_slots_per_view:
                     raise RuntimeError(
-                        f"View {view_idx} has {len(seeds)} objects, but "
-                        f"max_objects_per_view={self.max_objects_per_view}"
+                        f"View {view_idx} must seed every configured fixed slot: "
+                        f"got {len(seeds)}, expected {self.object_slots_per_view}"
                     )
 
         call_started = time.perf_counter()
@@ -678,6 +760,11 @@ class EfficientTAMMultiViewTracker(EfficientTAMTracker):
                 self._prepare_live_states(states)
                 self._assert_prepared_states(states)
                 self._live_prepared = True
+                snapshot = self.predictor.snapshot_multiview_image_features(
+                    states,
+                    frame_idx=0,
+                )
+                self._cache_feature_snapshot(snapshot)
 
         self.record_profile(
             "tracker_total_wall_cpu",
@@ -685,47 +772,98 @@ class EfficientTAMMultiViewTracker(EfficientTAMTracker):
         )
         return predictions
 
-    def track_views(self, rgbs: list[np.ndarray]) -> list[TrackerPrediction]:
-        """Append one synchronized frame per view and propagate once."""
+    def track_views(
+        self,
+        rgbs: list[np.ndarray],
+        *,
+        correction_reference_frame_idx: int | None = None,
+        correction_masks_per_view: list[list[np.ndarray]] | None = None,
+    ) -> list[TrackerPrediction]:
+        """Append one synchronized frame and run normal or direct correction.
+
+        Every frame is encoded exactly once through
+        ``snapshot_multiview_image_features``. The persistent snapshot is cached
+        in a bounded GPU ring and is reused immediately for ordinary propagation.
+        If a SAM3 correction for historical frame ``x`` is supplied, the same
+        current snapshot is instead used for direct ``x -> current`` correction.
+        """
         if len(rgbs) != self.num_views:
             raise ValueError(f"Expected {self.num_views} RGB views, got {len(rgbs)}")
-        if any(stream is None for stream in self.streams):
-            raise RuntimeError(
-                "EfficientTAM is not initialized; run a coordinated keyframe first"
-            )
         if not self.live_ready:
-            states = [stream.state for stream in self.streams if stream is not None]
-            raise RuntimeError(
-                "EfficientTAM is not prepared for multi-view propagation: "
-                f"execution_mode={self.execution_mode}, "
-                f"prepared={[self._state_prepared(s) for s in states]}, "
-                f"expected_ids={self.track_ids_per_view}, "
-                f"actual_ids={[self._state_real_ids(s) for s in states]}"
-            )
+            raise RuntimeError("EfficientTAM is not initialized/prepared")
 
         call_started = time.perf_counter()
         with self._gpu_guard():
             with torch.inference_mode(), self._autocast():
-                states: list[dict[str, Any]] = []
+                states = self._live_states()
                 frame_indices: list[int] = []
                 for stream, rgb in zip(self.streams, rgbs):
                     assert stream is not None
                     frame_indices.append(stream.append(rgb))
-                    states.append(stream.state)
-
                 if len(set(frame_indices)) != 1:
                     raise RuntimeError(
                         "Multi-view streams became misaligned: "
                         f"frame_indices={frame_indices}"
                     )
-                results = self.predictor.propagate_multiview_step(
+                frame_idx = int(frame_indices[0])
+                source = "propagation"
+                reference_idx: int | None = None
+                reference_snapshot: dict[str, Any] | None = None
+                if correction_reference_frame_idx is not None:
+                    reference_idx = int(correction_reference_frame_idx)
+                    if correction_masks_per_view is None:
+                        raise ValueError(
+                            "correction_masks_per_view is required with a reference frame"
+                        )
+                    # Hold the reference locally before inserting the current
+                    # snapshot, so a just-at-the-ring-limit reference is still usable.
+                    reference_snapshot = self._feature_snapshots.get(reference_idx)
+                    if reference_snapshot is None:
+                        raise KeyError(
+                            f"No cached EfficientTAM feature snapshot for frame {reference_idx}; "
+                            f"cached={list(self._feature_snapshots)}"
+                        )
+
+                current_snapshot = self.predictor.snapshot_multiview_image_features(
                     states,
-                    frame_idx=frame_indices[0],
-                    reverse=False,
+                    frame_idx=frame_idx,
                 )
+                self._cache_feature_snapshot(current_snapshot)
+
+                if correction_reference_frame_idx is not None:
+                    assert reference_idx is not None and reference_snapshot is not None
+                    if reference_idx >= frame_idx:
+                        raise ValueError(
+                            f"Direct correction requires reference < current, got "
+                            f"{reference_idx} -> {frame_idx}"
+                        )
+                    results = self.predictor.correct_multiview_from_reference(
+                        states,
+                        reference_feature_snapshot=reference_snapshot,
+                        reference_masks=correction_masks_per_view,
+                        current_frame_idx=frame_idx,
+                        current_feature_snapshot=current_snapshot,
+                        reverse=False,
+                    )
+                    source = "direct_correction"
+                else:
+                    results = self.predictor.propagate_multiview_step(
+                        states,
+                        frame_idx=frame_idx,
+                        reverse=False,
+                        image_feature_snapshot=current_snapshot,
+                    )
+
                 predictions = [
                     self._prediction_from_view_result(result) for result in results
                 ]
+                for prediction in predictions:
+                    prediction.metadata["tracking_source"] = source
+                    prediction.metadata["feature_cache_frames"] = len(
+                        self._feature_snapshots
+                    )
+                    if reference_idx is not None:
+                        prediction.metadata["reference_frame_idx"] = reference_idx
 
         self.record_profile(
             "tracker_total_wall_cpu",
@@ -755,7 +893,7 @@ class EfficientTAMMultiViewTracker(EfficientTAMTracker):
             "multiview",
             self.execution_mode,
             self.num_views,
-            self.max_objects_per_view,
+            self.object_slots_per_view,
             tuple(rgbs[0].shape),
             temporal_frames,
             self.prewarm_post_reset_frames,
@@ -771,7 +909,7 @@ class EfficientTAMMultiViewTracker(EfficientTAMTracker):
             print(
                 "[stage] EfficientTAM pre-warm: "
                 f"mode={self.execution_mode}, views={self.num_views}, "
-                f"max_objects/view={self.max_objects_per_view}, "
+                f"object_slots/view={self.object_slots_per_view}, "
                 f"temporal_frames={temporal_frames}, passes={self.prewarm_passes}",
                 flush=True,
             )
@@ -782,18 +920,22 @@ class EfficientTAMMultiViewTracker(EfficientTAMTracker):
             with self._gpu_guard():
                 with torch.inference_mode(), self._autocast():
                     for pass_index in range(self.prewarm_passes):
+                        # Normal path: encode+snapshot once, then propagate using
+                        # that persistent snapshot exactly like the live tracker.
                         temp_streams = [
                             self._new_stream_from_rgb(rgb, buffer_frames=buffer_frames)
                             for rgb in rgbs
                         ]
                         try:
                             states = [stream.state for stream in temp_streams]
+                            synthetic_per_view: list[list[np.ndarray]] = []
                             for view_idx, state in enumerate(states):
                                 masks = _synthetic_masks(
                                     rgbs[view_idx].shape[0],
                                     rgbs[view_idx].shape[1],
-                                    self.max_objects_per_view,
+                                    self.object_slots_per_view,
                                 )
+                                synthetic_per_view.append(masks)
                                 for obj_idx, mask in enumerate(masks, start=1):
                                     self.predictor.add_new_mask(
                                         inference_state=state,
@@ -815,10 +957,15 @@ class EfficientTAMMultiViewTracker(EfficientTAMTracker):
                                         )
                                     )
                                 started = time.perf_counter()
+                                snapshot = self.predictor.snapshot_multiview_image_features(
+                                    states,
+                                    frame_idx=frame_idx,
+                                )
                                 self.predictor.propagate_multiview_step(
                                     states,
                                     frame_idx=frame_idx,
                                     reverse=False,
+                                    image_feature_snapshot=snapshot,
                                 )
                                 if (
                                     torch.cuda.is_available()
@@ -830,6 +977,84 @@ class EfficientTAMMultiViewTracker(EfficientTAMTracker):
                                 )
                         finally:
                             for stream in temp_streams:
+                                stream.close()
+
+                        # Direct-correction path: corrected reference x -> current t,
+                        # followed by one ordinary propagation. This keeps the first
+                        # live asynchronous SAM3 result from triggering compilation.
+                        direct_streams = [
+                            self._new_stream_from_rgb(rgb, buffer_frames=buffer_frames)
+                            for rgb in rgbs
+                        ]
+                        try:
+                            states = [stream.state for stream in direct_streams]
+                            masks_per_view: list[list[np.ndarray]] = []
+                            for view_idx, state in enumerate(states):
+                                masks = _synthetic_masks(
+                                    rgbs[view_idx].shape[0],
+                                    rgbs[view_idx].shape[1],
+                                    self.object_slots_per_view,
+                                )
+                                masks_per_view.append(masks)
+                                for obj_idx, mask in enumerate(masks, start=1):
+                                    self.predictor.add_new_mask(
+                                        inference_state=state,
+                                        frame_idx=0,
+                                        obj_id=obj_idx,
+                                        mask=mask,
+                                    )
+                            self.predictor.prepare_multiview_states(
+                                states,
+                                conditioning_frame_idx=0,
+                            )
+
+                            for view_idx, stream in enumerate(direct_streams):
+                                stream.append(self._variant_rgb(rgbs[view_idx], 301 + view_idx))
+                            reference_snapshot = self.predictor.snapshot_multiview_image_features(
+                                states,
+                                frame_idx=1,
+                            )
+                            self.predictor.propagate_multiview_step(
+                                states,
+                                frame_idx=1,
+                                reverse=False,
+                                image_feature_snapshot=reference_snapshot,
+                            )
+
+                            for view_idx, stream in enumerate(direct_streams):
+                                stream.append(self._variant_rgb(rgbs[view_idx], 401 + view_idx))
+                            current_snapshot = self.predictor.snapshot_multiview_image_features(
+                                states,
+                                frame_idx=2,
+                            )
+                            self.predictor.correct_multiview_from_reference(
+                                states,
+                                reference_feature_snapshot=reference_snapshot,
+                                reference_masks=masks_per_view,
+                                current_frame_idx=2,
+                                current_feature_snapshot=current_snapshot,
+                                reverse=False,
+                            )
+
+                            for view_idx, stream in enumerate(direct_streams):
+                                stream.append(self._variant_rgb(rgbs[view_idx], 501 + view_idx))
+                            next_snapshot = self.predictor.snapshot_multiview_image_features(
+                                states,
+                                frame_idx=3,
+                            )
+                            self.predictor.propagate_multiview_step(
+                                states,
+                                frame_idx=3,
+                                reverse=False,
+                                image_feature_snapshot=next_snapshot,
+                            )
+                            if (
+                                torch.cuda.is_available()
+                                and str(self.device).startswith("cuda")
+                            ):
+                                torch.cuda.synchronize(torch.device(self.device))
+                        finally:
+                            for stream in direct_streams:
                                 stream.close()
 
             total_ms = 1000.0 * (time.perf_counter() - started_total)
@@ -848,11 +1073,12 @@ class EfficientTAMMultiViewTracker(EfficientTAMTracker):
                 "verification_max_ms": verify_max,
                 "execution_mode": self.execution_mode,
                 "views": self.num_views,
-                "max_objects_per_view": self.max_objects_per_view,
+                "object_slots_per_view": self.object_slots_per_view,
             }
 
     def close(self) -> None:
         self._live_prepared = False
+        self._feature_snapshots.clear()
         for stream in self.streams:
             if stream is not None:
                 stream.close()

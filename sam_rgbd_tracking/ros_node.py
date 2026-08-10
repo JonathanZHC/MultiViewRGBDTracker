@@ -11,23 +11,23 @@ from typing import Any
 
 import numpy as np
 
-from .component import SAMTrackingComponent
+from .async_sam3 import AsyncSAM3Worker
 from .config import load_config
 from .multiview_component import MultiViewEfficientTAMComponent
-from .visualization import RvizPublisher
+from .visualization import FusedRvizPublisher, RvizPublisher
+from .slots import object_slots_per_view
 
 
-# TorchInductor/CUDAGraph state is thread-local. Keep model construction,
-# pre-warm, correction and propagation on one persistent OS thread.
-_GPU_OWNER_EXECUTOR = ThreadPoolExecutor(
+# EfficientTAM TorchInductor/CUDAGraph state stays on one persistent OS thread.
+# SAM3 has its own persistent worker/thread and CUDA stream (AsyncSAM3Worker).
+_TRACKER_GPU_EXECUTOR = ThreadPoolExecutor(
     max_workers=1,
-    thread_name_prefix="sam-gpu-owner",
+    thread_name_prefix="efficienttam-gpu-owner",
 )
 
 
-def _run_on_gpu_owner(function, /, *args, **kwargs):
-    """Run model-owning work on the single persistent CUDAGraph thread."""
-    return _GPU_OWNER_EXECUTOR.submit(function, *args, **kwargs).result()
+def _run_on_tracker_owner(function, /, *args, **kwargs):
+    return _TRACKER_GPU_EXECUTOR.submit(function, *args, **kwargs).result()
 
 
 @dataclass
@@ -55,23 +55,52 @@ class _RateDiagnostics:
     RAW_STREAMS = ("color", "depth", "info")
 
     WORKER_STAGE_ORDER = (
-        "queue_wait_cpu",
-        "ros_decode_cpu",
-        "tf_lookup_cpu",
-        "component_cpu",
-        "rviz_build_cpu",
-        "ros_publish_cpu",
-        "worker_total_cpu",
+        "queue_wait",
+        "ros_decode",
+        "tf_lookup",
+        "component",
+        "rviz_pointcloud_build_cpu",
+        "rviz_markers_build_cpu",
+        "rviz_overlay_build_cpu",
+        "rviz_raw_mask_build_cpu",
+        "rviz_filtered_mask_build_cpu",
+        "rviz_fused_build_cpu",
+        "rviz_build",
+        "publish_points_cpu",
+        "publish_markers_cpu",
+        "publish_overlay_cpu",
+        "publish_raw_mask_cpu",
+        "publish_filtered_mask_cpu",
+        "publish_fused_cpu",
+        "ros_publish",
+        "worker_total",
     )
 
     PIPELINE_STAGE_ORDER = (
         "pipeline_total",
-        "postprocess_cpu",
-        "sam3_total_gpu",
-        "tracker_lock_wait_cpu",
-        "tracker_propagate_gpu",
-        "tracker_total_gpu",
-        "tracker_total_wall_cpu",
+        "sam3_filter",
+        "sam3_slot_assoc",
+        "sam3_async",
+        "tracker_reinit",
+        "tracker_propagate",
+        "tracker_direct_correction",
+        "postprocess_alignment_total",
+        "postprocess_total",
+        "postprocess_masks",
+        "postprocess_components",
+        "postprocess_geometry",
+        "postprocess_finalize",
+        "alignment_total",
+        "cross_view_voxelize",
+        "cross_view_bbox_gate",
+        "cross_view_voxel_match",
+        "cross_view_hungarian",
+        "cross_view_fusion",
+        "cross_view_total",
+        "cross_frame_gate",
+        "cross_frame_chamfer",
+        "cross_frame_hungarian",
+        "cross_frame_total",
     )
 
     SYNC_SKEW_ORDER = (
@@ -126,6 +155,7 @@ class _RateDiagnostics:
 
         self._worker_samples: dict[str, list[float]] = {}
         self._pipeline_samples: dict[str, list[float]] = {}
+        self._latest_instance_counters: dict[str, Any] = {}
 
         self._topics: dict[str, str] = {}
 
@@ -192,6 +222,7 @@ class _RateDiagnostics:
             self._total_keyframes = 0
             self._worker_samples = {}
             self._pipeline_samples = {}
+            self._latest_instance_counters = {}
             self._raw_window = {
                 name: self._new_raw_window_state() for name in self.RAW_STREAMS
             }
@@ -329,6 +360,32 @@ class _RateDiagnostics:
             for name, value in timings_ms.items():
                 self._pipeline_samples.setdefault(name, []).append(float(value))
 
+    def record_instance_counters(self, metadata: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        names = (
+            "num_active_instances_per_view",
+            "num_dummy_slots_per_view",
+            "num_cross_view_candidate_pairs",
+            "num_cross_view_matches",
+            "num_cross_frame_candidate_pairs",
+            "num_cross_frame_matches",
+            "num_multiview_instances",
+            "num_fused_points_before_downsample",
+            "num_fused_points_after_downsample",
+            "active_instances_per_view",
+            "dummy_slots_per_view",
+        )
+        with self._lock:
+            for name in names:
+                if name in metadata:
+                    self._latest_instance_counters[name] = metadata[name]
+            sam3_counts = metadata.get("num_sam3_detections_per_class")
+            if sam3_counts:
+                self._latest_instance_counters[
+                    "num_sam3_detections_per_class"
+                ] = dict(sam3_counts)
+
     def maybe_report(self, *, force: bool = False, queue_depth: int | None = None) -> None:
         if not self.enabled or not self._reporting_enabled:
             return
@@ -350,6 +407,7 @@ class _RateDiagnostics:
                 "keyframes": self._window_keyframes,
                 "worker": self._worker_samples,
                 "pipeline": self._pipeline_samples,
+                "instance_counters": dict(self._latest_instance_counters),
                 "total_input": self._total_input,
                 "total_processed": self._total_processed,
                 "total_published": self._total_published,
@@ -390,12 +448,44 @@ class _RateDiagnostics:
             self._window_keyframes = 0
             self._worker_samples = {}
             self._pipeline_samples = {}
+            self._latest_instance_counters = {}
             self._raw_window = {
                 name: self._new_raw_window_state() for name in self.RAW_STREAMS
             }
             self._sync_skew_samples = {}
 
         self._print_snapshot(snapshot, queue_depth=queue_depth)
+
+    @classmethod
+    def _append_stats_table(
+        cls,
+        lines: list[str],
+        title: str,
+        samples: dict[str, list[float]],
+        names: tuple[str, ...] | list[str],
+    ) -> None:
+        rows: list[tuple[str, int, float, float, float, float]] = []
+        for name in names:
+            values = samples.get(name, [])
+            if not values:
+                continue
+            mean, median, p95, maximum = cls._summary(values)
+            rows.append((name, len(values), mean, median, p95, maximum))
+        if not rows:
+            return
+
+        lines.append(f"  {title} (ms):")
+        lines.append(
+            "    "
+            f"{'stage':<34} {'n':>5} {'mean':>8} {'median':>8} "
+            f"{'p95':>8} {'max':>8}"
+        )
+        for name, count, mean, median, p95, maximum in rows:
+            lines.append(
+                "    "
+                f"{name:<34} {count:>5d} {mean:>8.2f} {median:>8.2f} "
+                f"{p95:>8.2f} {maximum:>8.2f}"
+            )
 
     def _print_camera_section(
         self,
@@ -410,7 +500,12 @@ class _RateDiagnostics:
         raw = snapshot["raw"]
         topics = snapshot["topics"]
 
-        lines.append("  raw camera topics:")
+        lines.append("  camera input:")
+        lines.append(
+            "    "
+            f"{'stream':<7} {'n':>5} {'wall Hz':>9} {'stamp Hz':>9} "
+            f"{'nonmono':>8}"
+        )
         for stream in self.RAW_STREAMS:
             state = raw[stream]
             count = int(state["count"])
@@ -421,51 +516,74 @@ class _RateDiagnostics:
                 state["stamp_last_ns"],
                 1e9,
             )
-            topic = topics.get(stream, "?")
-            stamp_text = "n/a" if stamp_hz is None else f"{stamp_hz:.2f} Hz"
+            stamp_text = "n/a" if stamp_hz is None else f"{stamp_hz:.2f}"
             lines.append(
-                f"    {stream:<5} wall={wall_hz:6.2f} Hz ({count:4d} msgs), "
-                f"stamp={stamp_text}, nonmono={int(state['nonmonotonic'])}, "
-                f"topic={topic}"
+                "    "
+                f"{stream:<7} {count:>5d} {wall_hz:>9.2f} {stamp_text:>9} "
+                f"{int(state['nonmonotonic']):>8d}"
+            )
+        if topics:
+            lines.append(
+                "    topics: "
+                + " | ".join(
+                    f"{stream}={topics.get(stream, '?')}"
+                    for stream in self.RAW_STREAMS
+                )
             )
 
-            wall_gaps = state["wall_gap_ms"]
-            if wall_gaps:
-                mean, median, p95, maximum = self._summary(wall_gaps)
-                lines.append(
-                    f"      wall gap: n={len(wall_gaps)}, mean={mean:.2f} ms, "
-                    f"median={median:.2f} ms, p95={p95:.2f} ms, max={maximum:.2f} ms"
+        gap_rows: list[tuple[str, str, int, float, float, float, float]] = []
+        for stream in self.RAW_STREAMS:
+            state = raw[stream]
+            for clock, key in (("wall", "wall_gap_ms"), ("stamp", "stamp_gap_ms")):
+                values = state[key]
+                if not values:
+                    continue
+                mean, median, p95, maximum = self._summary(values)
+                gap_rows.append(
+                    (stream, clock, len(values), mean, median, p95, maximum)
                 )
-            stamp_gaps = state["stamp_gap_ms"]
-            if stamp_gaps:
-                mean, median, p95, maximum = self._summary(stamp_gaps)
+        if gap_rows:
+            lines.append("  camera gaps (ms):")
+            lines.append(
+                "    "
+                f"{'stream':<7} {'clock':<6} {'n':>5} {'mean':>8} "
+                f"{'median':>8} {'p95':>8} {'max':>8}"
+            )
+            for stream, clock, count, mean, median, p95, maximum in gap_rows:
                 lines.append(
-                    f"      stamp gap: n={len(stamp_gaps)}, mean={mean:.2f} ms, "
-                    f"median={median:.2f} ms, p95={p95:.2f} ms, max={maximum:.2f} ms"
+                    "    "
+                    f"{stream:<7} {clock:<6} {count:>5d} {mean:>8.2f} "
+                    f"{median:>8.2f} {p95:>8.2f} {maximum:>8.2f}"
                 )
 
-        lines.append("  synchronization:")
-        lines.append(
-            f"    ApproximateTimeSynchronizer slop = {self.sync_slop_ms:.2f} ms"
-        )
+        lines.append(f"  synchronization: slop={self.sync_slop_ms:.2f} ms")
+        ratios = []
         for stream in self.RAW_STREAMS:
             raw_count = int(raw[stream]["count"])
             ratio = 100.0 * sync_count / max(1, raw_count)
-            lines.append(
-                f"    sync/raw {stream:<5} count ratio = {ratio:6.1f}% "
-                f"({sync_count}/{raw_count})"
-            )
+            ratios.append(f"{stream}={ratio:.1f}% ({sync_count}/{raw_count})")
+        lines.append("    sync/raw: " + " | ".join(ratios))
 
         sync_skew = snapshot["sync_skew"]
+        skew_rows = []
         for name in self.SYNC_SKEW_ORDER:
             values = sync_skew.get(name, [])
             if not values:
                 continue
             mean, median, p95, maximum = self._summary(values)
+            skew_rows.append((name, len(values), mean, median, p95, maximum))
+        if skew_rows:
             lines.append(
-                f"    {name}: n={len(values)}, mean={mean:.3f} ms, "
-                f"median={median:.3f} ms, p95={p95:.3f} ms, max={maximum:.3f} ms"
+                "    "
+                f"{'skew':<20} {'n':>5} {'mean':>8} {'median':>8} "
+                f"{'p95':>8} {'max':>8}"
             )
+            for name, count, mean, median, p95, maximum in skew_rows:
+                lines.append(
+                    "    "
+                    f"{name:<20} {count:>5d} {mean:>8.3f} {median:>8.3f} "
+                    f"{p95:>8.3f} {maximum:>8.3f}"
+                )
 
     def _print_snapshot(
         self,
@@ -486,424 +604,210 @@ class _RateDiagnostics:
 
         if self.camera_only:
             lines = [
-                f"[CameraOnly:{self.camera_name}] window={elapsed:.2f} s",
-                f"  RGB-D synchronized input = {input_hz:.2f} Hz ({input_count} packets)",
+                f"[CameraOnly:{self.camera_name}] {elapsed:.2f}s | "
+                f"input={input_hz:.2f} Hz ({input_count})"
             ]
         else:
+            queue_text = "n/a" if queue_depth is None else str(int(queue_depth))
             lines = [
-                f"[Rate:{self.camera_name}] window={elapsed:.2f} s",
-                f"  RGB-D synchronized input = {input_hz:.2f} Hz ({input_count} packets)",
-                f"  processed                = {processed_hz:.2f} Hz ({processed_count} frames)",
-                f"  published                = {published_hz:.2f} Hz ({published_count} frames)",
-                f"  dropped                  = {dropped_count} ({drop_pct:.1f}% of synchronized input)",
-                f"  worker errors             = {int(snapshot['errors'])}",
-                f"  keyframes                 = {int(snapshot['keyframes'])}",
+                f"[Rate:{self.camera_name}] {elapsed:.2f}s | "
+                f"input={input_hz:.2f} Hz | processed={processed_hz:.2f} Hz | "
+                f"published={published_hz:.2f} Hz | drop={drop_pct:.1f}% "
+                f"({dropped_count}/{input_count})",
+                f"  state: queue={queue_text} | errors={int(snapshot['errors'])} | "
+                f"keyframes={int(snapshot['keyframes'])}",
             ]
-            if queue_depth is not None:
-                lines.append(f"  queue depth now           = {int(queue_depth)}")
 
         self._print_camera_section(lines, snapshot)
 
+        raw = snapshot["raw"]
         if self.camera_only:
-            raw = snapshot["raw"]
-            lines.extend(
-                [
-                    "  cumulative:",
-                    f"    sync_input={int(snapshot['total_input'])}",
-                    "    raw=" + ", ".join(
-                        f"{stream}:{int(raw[stream]['total_count'])}"
-                        f"(nonmono={int(raw[stream]['total_nonmonotonic'])})"
-                        for stream in self.RAW_STREAMS
-                    ),
-                ]
+            lines.append(
+                f"  cumulative: sync_input={int(snapshot['total_input'])} | "
+                + " | ".join(
+                    f"{stream}={int(raw[stream]['total_count'])}"
+                    f"(nonmono={int(raw[stream]['total_nonmonotonic'])})"
+                    for stream in self.RAW_STREAMS
+                )
             )
             print("\n".join(lines), flush=True)
             return
 
-        lines.append("  worker timing:")
         worker_samples = snapshot["worker"]
-        for name in self.WORKER_STAGE_ORDER:
-            values = worker_samples.get(name, [])
-            if not values:
-                continue
-            mean, median, p95, maximum = self._summary(values)
-            lines.append(
-                f"    {name}: n={len(values)}, mean={mean:.2f} ms, "
-                f"median={median:.2f} ms, p95={p95:.2f} ms, max={maximum:.2f} ms"
-            )
+        self._append_stats_table(
+            lines,
+            "worker core",
+            worker_samples,
+            (
+                "queue_wait",
+                "ros_decode",
+                "tf_lookup",
+                "component",
+                "worker_total",
+            ),
+        )
+        self._append_stats_table(
+            lines,
+            "visualization build",
+            worker_samples,
+            (
+                "rviz_pointcloud_build_cpu",
+                "rviz_markers_build_cpu",
+                "rviz_overlay_build_cpu",
+                "rviz_raw_mask_build_cpu",
+                "rviz_filtered_mask_build_cpu",
+                "rviz_fused_build_cpu",
+                "rviz_build",
+            ),
+        )
+        self._append_stats_table(
+            lines,
+            "ROS publish",
+            worker_samples,
+            (
+                "publish_points_cpu",
+                "publish_markers_cpu",
+                "publish_overlay_cpu",
+                "publish_raw_mask_cpu",
+                "publish_filtered_mask_cpu",
+                "publish_fused_cpu",
+                "ros_publish",
+            ),
+        )
 
-        lines.append("  pipeline / periodic stalls:")
+        counters = snapshot.get("instance_counters", {})
+        if counters:
+            lines.append("  instances / alignment (latest):")
+            active = counters.get(
+                "active_instances_per_view",
+                counters.get("num_active_instances_per_view", "-"),
+            )
+            dummy = counters.get(
+                "dummy_slots_per_view",
+                counters.get("num_dummy_slots_per_view", "-"),
+            )
+            lines.append(
+                "    "
+                f"active/view={active} | dummy/view={dummy} | "
+                f"multiview={counters.get('num_multiview_instances', '-')}"
+            )
+            lines.append(
+                "    "
+                f"cross-view: candidates={counters.get('num_cross_view_candidate_pairs', '-')} "
+                f"matches={counters.get('num_cross_view_matches', '-')} | "
+                f"cross-frame: candidates={counters.get('num_cross_frame_candidate_pairs', '-')} "
+                f"matches={counters.get('num_cross_frame_matches', '-')}"
+            )
+            before = counters.get("num_fused_points_before_downsample")
+            after = counters.get("num_fused_points_after_downsample")
+            if before is not None and after is not None:
+                reduction = 100.0 * (1.0 - float(after) / max(1.0, float(before)))
+                lines.append(
+                    f"    fused PCD: {int(before)} -> {int(after)} points "
+                    f"({reduction:.1f}% removed at shared voxel resolution)"
+                )
+            sam3_counts = counters.get("num_sam3_detections_per_class")
+            if sam3_counts:
+                lines.append(
+                    "    SAM3/class: "
+                    + " | ".join(
+                        f"{label}={count}" for label, count in sam3_counts.items()
+                    )
+                )
+
         pipeline_samples = snapshot["pipeline"]
-        for name in self.PIPELINE_STAGE_ORDER:
-            values = pipeline_samples.get(name, [])
-            if not values:
-                continue
-            mean, median, p95, maximum = self._summary(values)
-            lines.append(
-                f"    {name}: n={len(values)}, mean={mean:.2f} ms, "
-                f"median={median:.2f} ms, p95={p95:.2f} ms, max={maximum:.2f} ms"
-            )
+        self._append_stats_table(
+            lines,
+            "batched pipeline",
+            pipeline_samples,
+            ("pipeline_total",),
+        )
+        self._append_stats_table(
+            lines,
+            "postprocess + alignment",
+            pipeline_samples,
+            ("postprocess_alignment_total",),
+        )
+        self._append_stats_table(
+            lines,
+            "batched postprocess",
+            pipeline_samples,
+            (
+                "postprocess_total",
+                "postprocess_masks",
+                "postprocess_components",
+                "postprocess_geometry",
+                "postprocess_finalize",
+            ),
+        )
+        self._append_stats_table(
+            lines,
+            "alignment",
+            pipeline_samples,
+            ("alignment_total",),
+        )
+        self._append_stats_table(
+            lines,
+            "cross-view",
+            pipeline_samples,
+            (
+                "cross_view_voxelize",
+                "cross_view_bbox_gate",
+                "cross_view_voxel_match",
+                "cross_view_hungarian",
+                "cross_view_fusion",
+                "cross_view_total",
+            ),
+        )
+        self._append_stats_table(
+            lines,
+            "cross-frame",
+            pipeline_samples,
+            (
+                "cross_frame_gate",
+                "cross_frame_chamfer",
+                "cross_frame_hungarian",
+                "cross_frame_total",
+            ),
+        )
+        self._append_stats_table(
+            lines,
+            "SAM3 refresh",
+            pipeline_samples,
+            (
+                "sam3_filter",
+                "sam3_slot_assoc",
+                "sam3_async",
+            ),
+        )
+        self._append_stats_table(
+            lines,
+            "tracker",
+            pipeline_samples,
+            (
+                "tracker_reinit",
+                "tracker_propagate",
+                "tracker_direct_correction",
+            ),
+        )
 
-        raw = snapshot["raw"]
-        lines.extend(
-            [
-                "  cumulative:",
-                f"    sync_input={int(snapshot['total_input'])}, "
-                f"processed={int(snapshot['total_processed'])}, "
-                f"published={int(snapshot['total_published'])}, "
-                f"dropped={int(snapshot['total_dropped'])}, "
-                f"errors={int(snapshot['total_errors'])}, "
-                f"keyframes={int(snapshot['total_keyframes'])}",
-                "    raw=" + ", ".join(
-                    f"{stream}:{int(raw[stream]['total_count'])}"
-                    f"(nonmono={int(raw[stream]['total_nonmonotonic'])})"
-                    for stream in self.RAW_STREAMS
-                ),
-            ]
+        lines.append(
+            f"  cumulative: input={int(snapshot['total_input'])} | "
+            f"processed={int(snapshot['total_processed'])} | "
+            f"published={int(snapshot['total_published'])} | "
+            f"dropped={int(snapshot['total_dropped'])} | "
+            f"errors={int(snapshot['total_errors'])} | "
+            f"keyframes={int(snapshot['total_keyframes'])}"
         )
         print("\n".join(lines), flush=True)
-
-
-class _CameraWorker:
-    """Keep only the newest synchronized RGB-D frame for one camera."""
-
-    def __init__(self, node: Any, camera_name: str, config) -> None:
-        import message_filters
-        from cv_bridge import CvBridge
-        from sensor_msgs.msg import CameraInfo, Image
-        from rclpy.qos import qos_profile_sensor_data
-
-        self.node = node
-        self.camera_name = camera_name
-        self.config = config
-        self.bridge = CvBridge()
-        self.component = _run_on_gpu_owner(
-            SAMTrackingComponent,
-            config,
-            camera_name=camera_name,
-        )
-        self.visualizer = RvizPublisher(node, camera_name, config)
-        self.diagnostics = _RateDiagnostics(node, camera_name, config)
-        backend = str(config.tracker.backend)
-        if backend != "sam_mt":
-            raise ValueError("_CameraWorker is reserved for the SAM-MT backend")
-        self._prewarm_pending = bool(
-            config.tracker.sam_mt.get("compile_image_encoder", True)
-            and config.tracker.sam_mt.get("prewarm_enabled", True)
-        )
-        self._live = False
-        self.queue: queue.Queue[_Packet] = queue.Queue(
-            maxsize=int(config.runtime.queue_size)
-        )
-        self.stop_event = threading.Event()
-        self.thread = threading.Thread(
-            target=self._run,
-            name=f"tracking-{camera_name}",
-            daemon=True,
-        )
-
-        color_topic = str(config.ros.color_topic).format(camera=camera_name)
-        depth_topic = str(config.ros.depth_topic).format(camera=camera_name)
-        info_topic = str(config.ros.camera_info_topic).format(camera=camera_name)
-        self.diagnostics.set_topics(
-            color=color_topic,
-            depth=depth_topic,
-            info=info_topic,
-        )
-
-        self.color_sub = message_filters.Subscriber(
-            node,
-            Image,
-            color_topic,
-            qos_profile=qos_profile_sensor_data,
-        )
-        self.depth_sub = message_filters.Subscriber(
-            node,
-            Image,
-            depth_topic,
-            qos_profile=qos_profile_sensor_data,
-        )
-        self.info_sub = message_filters.Subscriber(
-            node,
-            CameraInfo,
-            info_topic,
-            qos_profile=qos_profile_sensor_data,
-        )
-
-        # Tap each raw message_filters subscriber before synchronization. These
-        # callbacks do not decode images and do not alter the messages; they only
-        # count arrivals and inspect header timestamps.
-        self.color_sub.registerCallback(self._raw_color_callback)
-        self.depth_sub.registerCallback(self._raw_depth_callback)
-        self.info_sub.registerCallback(self._raw_info_callback)
-
-        self.sync = message_filters.ApproximateTimeSynchronizer(
-            [self.color_sub, self.depth_sub, self.info_sub],
-            queue_size=max(4, int(config.runtime.queue_size) * 2),
-            slop=float(config.ros.sync_slop_seconds),
-        )
-        self.sync.registerCallback(self._sync_callback)
-        self.thread.start()
-
-        self.node.get_logger().info(
-            f"{camera_name}: initialized backend={backend}; "
-            "waiting for tracking startup"
-        )
-
-    def _raw_color_callback(self, message: Any) -> None:
-        self.diagnostics.on_raw_message("color", message)
-
-    def _raw_depth_callback(self, message: Any) -> None:
-        self.diagnostics.on_raw_message("depth", message)
-
-    def _raw_info_callback(self, message: Any) -> None:
-        self.diagnostics.on_raw_message("info", message)
-
-    def _sync_callback(self, color: Any, depth: Any, info: Any) -> None:
-        self.diagnostics.on_sync_input(color, depth, info)
-        packet = _Packet(
-            color=color,
-            depth=depth,
-            info=info,
-            enqueue_wall_s=time.perf_counter(),
-        )
-        try:
-            self.queue.put_nowait(packet)
-            self.diagnostics.maybe_report(queue_depth=self.queue.qsize())
-            return
-        except queue.Full:
-            pass
-
-        if not bool(self.config.runtime.drop_when_busy):
-            # The newest synchronized packet itself is rejected.
-            self.diagnostics.on_drop()
-            self.diagnostics.maybe_report(queue_depth=self.queue.qsize())
-            return
-
-        # Keep only the newest packet. The pending packet removed from the
-        # bounded queue is a real dropped synchronized input frame.
-        try:
-            self.queue.get_nowait()
-            self.diagnostics.on_drop()
-        except queue.Empty:
-            pass
-        try:
-            self.queue.put_nowait(packet)
-        except queue.Full:
-            # Very unlikely race; if it happens, the new packet is also lost.
-            self.diagnostics.on_drop()
-        self.diagnostics.maybe_report(queue_depth=self.queue.qsize())
-
-    def _world_from_camera(
-        self,
-        frame_id: str,
-        stamp: Any,
-    ) -> np.ndarray | None:
-        try:
-            from rclpy.duration import Duration
-            from rclpy.time import Time
-            from tf2_ros import Buffer, TransformListener
-
-            if not hasattr(self, "tf_buffer"):
-                self.tf_buffer = Buffer()
-                self.tf_listener = TransformListener(
-                    self.tf_buffer,
-                    self.node,
-                    spin_thread=False,
-                )
-            transform = self.tf_buffer.lookup_transform(
-                str(self.config.ros.world_frame),
-                frame_id,
-                Time.from_msg(stamp),
-                timeout=Duration(seconds=0.01),
-            )
-        except Exception:
-            return None
-
-        translation = transform.transform.translation
-        quaternion = transform.transform.rotation
-        x, y, z, w = (
-            float(quaternion.x),
-            float(quaternion.y),
-            float(quaternion.z),
-            float(quaternion.w),
-        )
-        rotation = np.array(
-            [
-                [1 - 2 * (y*y + z*z), 2 * (x*y - z*w), 2 * (x*z + y*w)],
-                [2 * (x*y + z*w), 1 - 2 * (x*x + z*z), 2 * (y*z - x*w)],
-                [2 * (x*z - y*w), 2 * (y*z + x*w), 1 - 2 * (x*x + y*y)],
-            ],
-            dtype=np.float32,
-        )
-        result = np.eye(4, dtype=np.float32)
-        result[:3, :3] = rotation
-        result[:3, 3] = [
-            float(translation.x),
-            float(translation.y),
-            float(translation.z),
-        ]
-        return result
-
-    @staticmethod
-    def _elapsed_ms(start_s: float) -> float:
-        return 1000.0 * (time.perf_counter() - start_s)
-
-    def _run(self) -> None:
-        while not self.stop_event.is_set():
-            try:
-                packet = self.queue.get(timeout=0.1)
-            except queue.Empty:
-                self.diagnostics.maybe_report(queue_depth=self.queue.qsize())
-                continue
-
-            worker_start = time.perf_counter()
-            became_live = False
-            self.diagnostics.record_worker_stage(
-                "queue_wait_cpu",
-                1000.0 * (worker_start - packet.enqueue_wall_s),
-            )
-
-            try:
-                stage_start = time.perf_counter()
-                rgb = self.bridge.imgmsg_to_cv2(
-                    packet.color,
-                    desired_encoding="rgb8",
-                )
-                depth = np.asarray(
-                    self.bridge.imgmsg_to_cv2(
-                        packet.depth,
-                        desired_encoding="passthrough",
-                    )
-                )
-                if depth.dtype == np.uint16:
-                    depth_m = depth.astype(np.float32) * 0.001
-                else:
-                    depth_m = depth.astype(np.float32, copy=False)
-                self.diagnostics.record_worker_stage(
-                    "ros_decode_cpu",
-                    self._elapsed_ms(stage_start),
-                )
-
-                if self._prewarm_pending:
-                    self.node.get_logger().info(
-                        f"{self.camera_name}: SAM-MT pre-warm started"
-                    )
-                    warmup_result = _run_on_gpu_owner(
-                        self.component.prewarm_tracker,
-                        rgb,
-                    )
-                    self._prewarm_pending = False
-
-                    # Frames accumulated while compilation/capture was running are
-                    # intentionally stale. Drop them without counting them in the
-                    # live benchmark, then start a fresh diagnostics epoch.
-                    while True:
-                        try:
-                            self.queue.get_nowait()
-                        except queue.Empty:
-                            break
-                    self.diagnostics.reset_all()
-                    self.node.get_logger().info(
-                        f"{self.camera_name}: pre-warm complete "
-                        f"performed={warmup_result.get('performed', False)}; "
-                        "waiting for first live tracking frame"
-                    )
-                    worker_start = None
-                    continue
-
-                intrinsics = packet.info.k
-                frame_id = (
-                    packet.color.header.frame_id
-                    or f"{self.camera_name}_optical_frame"
-                )
-                stamp = packet.color.header.stamp
-
-                stage_start = time.perf_counter()
-                world_from_camera = self._world_from_camera(frame_id, stamp)
-                self.diagnostics.record_worker_stage(
-                    "tf_lookup_cpu",
-                    self._elapsed_ms(stage_start),
-                )
-
-                timestamp_ns = (
-                    int(stamp.sec) * 1_000_000_000
-                    + int(stamp.nanosec)
-                )
-
-                stage_start = time.perf_counter()
-                result = _run_on_gpu_owner(
-                    self.component.process_arrays,
-                    rgb,
-                    depth_m,
-                    fx=float(intrinsics[0]),
-                    fy=float(intrinsics[4]),
-                    cx=float(intrinsics[2]),
-                    cy=float(intrinsics[5]),
-                    timestamp_ns=timestamp_ns,
-                    world_from_camera=world_from_camera,
-                )
-                self.diagnostics.record_worker_stage(
-                    "component_cpu",
-                    self._elapsed_ms(stage_start),
-                )
-                self.diagnostics.record_pipeline_timings(result.timings_ms)
-                self.diagnostics.on_processed(keyframe=bool(result.keyframe))
-
-                stage_start = time.perf_counter()
-                messages = self.visualizer.build_messages(result, stamp)
-                self.diagnostics.record_worker_stage(
-                    "rviz_build_cpu",
-                    self._elapsed_ms(stage_start),
-                )
-
-                stage_start = time.perf_counter()
-                self.visualizer.publish_messages(messages)
-                self.diagnostics.record_worker_stage(
-                    "ros_publish_cpu",
-                    self._elapsed_ms(stage_start),
-                )
-                self.diagnostics.on_published()
-                became_live = not self._live
-            except Exception as error:
-                self.diagnostics.on_error()
-                self.node.get_logger().error(
-                    f"{self.camera_name}: "
-                    f"{type(error).__name__}: {error}\n"
-                    f"{traceback.format_exc()}"
-                )
-            finally:
-                if worker_start is not None:
-                    self.diagnostics.record_worker_stage(
-                        "worker_total_cpu",
-                        self._elapsed_ms(worker_start),
-                    )
-                if became_live:
-                    self._live = True
-                    self.diagnostics.start_reporting()
-                    self.node.get_logger().info(
-                        f"{self.camera_name}: tracking LIVE "
-                        f"backend={self.config.tracker.backend}"
-                    )
-                self.diagnostics.maybe_report(queue_depth=self.queue.qsize())
-
-    def close(self) -> None:
-        self.stop_event.set()
-        self.thread.join(timeout=2.0)
-        self.diagnostics.maybe_report(
-            force=True,
-            queue_depth=self.queue.qsize(),
-        )
-        _run_on_gpu_owner(self.component.print_stats)
-        _run_on_gpu_owner(self.component.close)
 
 
 class _MultiViewEfficientTAMWorker:
     """Synchronize camera bundles and run one shared EfficientTAM predictor.
 
-    Each camera keeps its own ROS subscriptions, diagnostics, SAM3 association
-    state, post-processing, and RViz publisher.  Only the EfficientTAM model
-    execution is shared/batched.
+    Cameras keep separate ROS subscriptions/RViz publishers, while tracker,
+    post-processing, alignment, profiling, and rate reporting operate once per
+    synchronized multi-view bundle.
     """
 
     def __init__(self, node: Any, config) -> None:
@@ -916,17 +820,33 @@ class _MultiViewEfficientTAMWorker:
         self.config = config
         self.camera_names = [str(name) for name in config.runtime.camera_names]
         self.bridge = CvBridge()
-        self.component = _run_on_gpu_owner(
+        self.component = _run_on_tracker_owner(
             MultiViewEfficientTAMComponent,
             config,
             camera_names=self.camera_names,
         )
-        self.visualizers = {
-            name: RvizPublisher(node, name, config) for name in self.camera_names
-        }
-        self.diagnostics = {
-            name: _RateDiagnostics(node, name, config) for name in self.camera_names
-        }
+        # SAM3 owns a separate persistent thread + CUDA stream so sparse B=views
+        # detection can overlap continuous EfficientTAM tracking.
+        self.sam3_worker = AsyncSAM3Worker(config)
+        self.visualization_enabled = bool(
+            config.runtime.get("enable_visualization", True)
+        )
+        self.visualizers = (
+            {
+                name: RvizPublisher(node, name, config)
+                for name in self.camera_names
+            }
+            if self.visualization_enabled
+            else {}
+        )
+        self.fused_visualizer = (
+            FusedRvizPublisher(node, config) if self.visualization_enabled else None
+        )
+        # Normal tracking reports one synchronized-bundle stream. Per-camera raw
+        # diagnostics remain available in CameraOnlyNode, but are intentionally not
+        # attached here so the batched real-time path pays no diagnostic callback cost.
+        self.batch_diagnostics = _RateDiagnostics(node, "batch", config)
+        self.batch_diagnostics.camera_enabled = False
 
         self.queue: queue.Queue[list[_Packet]] = queue.Queue(
             maxsize=max(1, int(config.runtime.queue_size))
@@ -947,6 +867,18 @@ class _MultiViewEfficientTAMWorker:
             config.tracker.efficient_tam.get("prewarm_enabled", True)
         )
         self._live = False
+        self._initialized = False
+
+        # Reuse the small Python orchestration containers every cycle.  Frame
+        # arrays themselves are not recycled because asynchronous SAM3 keeps
+        # reference RGB-D frames alive until its correction result returns.
+        self._view_inputs: list[dict[str, Any]] = [
+            {} for _ in self.camera_names
+        ]
+        self._rgbs: list[np.ndarray] = [
+            np.empty((0, 0, 3), dtype=np.uint8)
+            for _ in self.camera_names
+        ]
 
         self.color_subs: dict[str, Any] = {}
         self.depth_subs: dict[str, Any] = {}
@@ -957,12 +889,6 @@ class _MultiViewEfficientTAMWorker:
             color_topic = str(config.ros.color_topic).format(camera=camera_name)
             depth_topic = str(config.ros.depth_topic).format(camera=camera_name)
             info_topic = str(config.ros.camera_info_topic).format(camera=camera_name)
-            self.diagnostics[camera_name].set_topics(
-                color=color_topic,
-                depth=depth_topic,
-                info=info_topic,
-            )
-
             color_sub = message_filters.Subscriber(
                 node,
                 Image,
@@ -981,22 +907,6 @@ class _MultiViewEfficientTAMWorker:
                 info_topic,
                 qos_profile=qos_profile_sensor_data,
             )
-            color_sub.registerCallback(
-                lambda message, name=camera_name: self._raw_callback(
-                    name, "color", message
-                )
-            )
-            depth_sub.registerCallback(
-                lambda message, name=camera_name: self._raw_callback(
-                    name, "depth", message
-                )
-            )
-            info_sub.registerCallback(
-                lambda message, name=camera_name: self._raw_callback(
-                    name, "info", message
-                )
-            )
-
             sync = message_filters.ApproximateTimeSynchronizer(
                 [color_sub, depth_sub, info_sub],
                 queue_size=max(4, int(config.runtime.queue_size) * 2),
@@ -1025,16 +935,13 @@ class _MultiViewEfficientTAMWorker:
             f"cameras={self.camera_names}, "
             f"execution_mode={self.component.execution_mode}, "
             f"{self.component.execution_description}; "
-            "waiting for pre-warm/first keyframe"
+            "waiting for pre-warm/initial SAM3 seed"
         )
 
     @staticmethod
     def _stamp_ns(message: Any) -> int:
         stamp = message.header.stamp
         return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
-
-    def _raw_callback(self, camera_name: str, stream: str, message: Any) -> None:
-        self.diagnostics[camera_name].on_raw_message(stream, message)
 
     def _sync_callback(
         self,
@@ -1043,8 +950,6 @@ class _MultiViewEfficientTAMWorker:
         depth: Any,
         info: Any,
     ) -> None:
-        diagnostics = self.diagnostics[camera_name]
-        diagnostics.on_sync_input(color, depth, info)
         packet = _Packet(
             color=color,
             depth=depth,
@@ -1054,9 +959,8 @@ class _MultiViewEfficientTAMWorker:
 
         ready_bundle: list[_Packet] | None = None
         with self._packet_lock:
-            previous = self._latest_packets.get(camera_name)
-            if previous is not None:
-                diagnostics.on_drop()
+            # Keep only the newest synchronized packet from each view until a
+            # complete cross-view bundle is available.
             self._latest_packets[camera_name] = packet
 
             while all(name in self._latest_packets for name in self.camera_names):
@@ -1078,12 +982,12 @@ class _MultiViewEfficientTAMWorker:
                 for name, stamp_ns in stamps.items():
                     if stamp_ns == oldest_stamp:
                         self._latest_packets.pop(name, None)
-                        self.diagnostics[name].on_drop()
 
         if ready_bundle is not None:
+            first = ready_bundle[0]
+            self.batch_diagnostics.on_sync_input(first.color, first.depth, first.info)
             self._enqueue_bundle(ready_bundle)
-        for diag in self.diagnostics.values():
-            diag.maybe_report(queue_depth=self.queue.qsize())
+        self.batch_diagnostics.maybe_report(queue_depth=self.queue.qsize())
 
     def _enqueue_bundle(self, bundle: list[_Packet]) -> None:
         try:
@@ -1093,21 +997,18 @@ class _MultiViewEfficientTAMWorker:
             pass
 
         if not bool(self.config.runtime.drop_when_busy):
-            for diagnostics in self.diagnostics.values():
-                diagnostics.on_drop()
+            self.batch_diagnostics.on_drop()
             return
 
         try:
             self.queue.get_nowait()
-            for diagnostics in self.diagnostics.values():
-                diagnostics.on_drop()
+            self.batch_diagnostics.on_drop()
         except queue.Empty:
             pass
         try:
             self.queue.put_nowait(bundle)
         except queue.Full:
-            for diagnostics in self.diagnostics.values():
-                diagnostics.on_drop()
+            self.batch_diagnostics.on_drop()
 
     def _world_from_camera(self, frame_id: str, stamp: Any) -> np.ndarray | None:
         try:
@@ -1164,11 +1065,20 @@ class _MultiViewEfficientTAMWorker:
         self,
         bundle: list[_Packet],
     ) -> tuple[list[dict[str, Any]], list[np.ndarray]]:
-        view_inputs: list[dict[str, Any]] = []
-        rgbs: list[np.ndarray] = []
-        for camera_name, packet in zip(self.camera_names, bundle):
+        # ``self._view_inputs`` and ``self._rgbs`` are persistent containers.
+        # Only their references/values are refreshed here, eliminating per-frame
+        # list/dict construction without recycling image arrays that SAM3 may
+        # still own asynchronously.
+        decode_ms = 0.0
+        tf_ms = 0.0
+        for view_index, (camera_name, packet) in enumerate(
+            zip(self.camera_names, bundle)
+        ):
             stage_started = time.perf_counter()
-            rgb = self.bridge.imgmsg_to_cv2(packet.color, desired_encoding="rgb8")
+            rgb_decoded = self.bridge.imgmsg_to_cv2(
+                packet.color,
+                desired_encoding="rgb8",
+            )
             depth = np.asarray(
                 self.bridge.imgmsg_to_cv2(
                     packet.depth,
@@ -1176,13 +1086,20 @@ class _MultiViewEfficientTAMWorker:
                 )
             )
             if depth.dtype == np.uint16:
-                depth_m = depth.astype(np.float32) * 0.001
+                # One owning float32 depth array is intentional: an async SAM3
+                # reference can outlive this worker iteration and correction uses
+                # its historical depth for association.
+                depth_m = depth.astype(np.float32)
+                depth_m *= np.float32(0.001)
             else:
-                depth_m = depth.astype(np.float32, copy=False)
-            self.diagnostics[camera_name].record_worker_stage(
-                "ros_decode_cpu",
-                self._elapsed_ms(stage_started),
-            )
+                depth_m = np.asarray(depth, dtype=np.float32)
+                if not depth_m.flags.c_contiguous:
+                    depth_m = np.ascontiguousarray(depth_m)
+
+            rgb = np.asarray(rgb_decoded, dtype=np.uint8)
+            if not rgb.flags.c_contiguous:
+                rgb = np.ascontiguousarray(rgb)
+            decode_ms += self._elapsed_ms(stage_started)
 
             intrinsics = packet.info.k
             frame_id = (
@@ -1193,44 +1110,38 @@ class _MultiViewEfficientTAMWorker:
 
             stage_started = time.perf_counter()
             world_from_camera = self._world_from_camera(frame_id, stamp)
-            self.diagnostics[camera_name].record_worker_stage(
-                "tf_lookup_cpu",
-                self._elapsed_ms(stage_started),
-            )
+            tf_ms += self._elapsed_ms(stage_started)
             timestamp_ns = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
 
-            rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
-            rgbs.append(rgb)
-            view_inputs.append(
-                {
-                    "rgb": rgb,
-                    "depth_m": np.ascontiguousarray(depth_m, dtype=np.float32),
-                    "fx": float(intrinsics[0]),
-                    "fy": float(intrinsics[4]),
-                    "cx": float(intrinsics[2]),
-                    "cy": float(intrinsics[5]),
-                    "timestamp_ns": timestamp_ns,
-                    "world_from_camera": world_from_camera,
-                }
-            )
-        return view_inputs, rgbs
+            view_input = self._view_inputs[view_index]
+            view_input["rgb"] = rgb
+            view_input["depth_m"] = depth_m
+            view_input["fx"] = float(intrinsics[0])
+            view_input["fy"] = float(intrinsics[4])
+            view_input["cx"] = float(intrinsics[2])
+            view_input["cy"] = float(intrinsics[5])
+            view_input["timestamp_ns"] = timestamp_ns
+            view_input["world_from_camera"] = world_from_camera
+            self._rgbs[view_index] = rgb
+
+        self.batch_diagnostics.record_worker_stage("ros_decode", decode_ms)
+        self.batch_diagnostics.record_worker_stage("tf_lookup", tf_ms)
+        return self._view_inputs, self._rgbs
 
     def _run(self) -> None:
         while not self.stop_event.is_set():
             try:
                 bundle = self.queue.get(timeout=0.1)
             except queue.Empty:
-                for diagnostics in self.diagnostics.values():
-                    diagnostics.maybe_report(queue_depth=self.queue.qsize())
+                self.batch_diagnostics.maybe_report(queue_depth=self.queue.qsize())
                 continue
 
             worker_started = time.perf_counter()
             became_live = False
-            for camera_name, packet in zip(self.camera_names, bundle):
-                self.diagnostics[camera_name].record_worker_stage(
-                    "queue_wait_cpu",
-                    1000.0 * (worker_started - packet.enqueue_wall_s),
-                )
+            self.batch_diagnostics.record_worker_stage(
+                "queue_wait",
+                max(1000.0 * (worker_started - packet.enqueue_wall_s) for packet in bundle),
+            )
 
             try:
                 view_inputs, rgbs = self._decode_bundle(bundle)
@@ -1240,9 +1151,9 @@ class _MultiViewEfficientTAMWorker:
                         "EfficientTAM multi-view pre-warm started; "
                         f"execution_mode={self.component.execution_mode}, "
                         f"views={len(self.camera_names)}, "
-                        f"max_objects_per_view={self.component.max_objects_per_view}"
+                        f"object_slots_per_view={self.component.object_slots_per_view}"
                     )
-                    warmup_result = _run_on_gpu_owner(
+                    warmup_result = _run_on_tracker_owner(
                         self.component.prewarm_tracker,
                         rgbs,
                     )
@@ -1254,54 +1165,134 @@ class _MultiViewEfficientTAMWorker:
                             break
                     with self._packet_lock:
                         self._latest_packets.clear()
-                    for diagnostics in self.diagnostics.values():
-                        diagnostics.reset_all()
+                    self.batch_diagnostics.reset_all()
                     self.node.get_logger().info(
                         "EfficientTAM multi-view pre-warm complete "
                         f"performed={warmup_result.get('performed', False)}; "
-                        "waiting for first coordinated keyframe"
+                        "waiting for initial batched SAM3 seed"
                     )
                     continue
 
                 stage_started = time.perf_counter()
-                results = _run_on_gpu_owner(
-                    self.component.process_arrays_batch,
-                    view_inputs,
-                )
+                if not self._initialized:
+                    # The very first SAM3 inference has no old tracker state to run
+                    # against, so it is the only detector call that the live path
+                    # waits for. It still executes on the dedicated SAM3 thread.
+                    initial_frames = _run_on_tracker_owner(
+                        self.component.make_frames_batch,
+                        view_inputs,
+                    )
+                    initial_sam3 = self.sam3_worker.run_blocking(
+                        frame_index=int(initial_frames[0].frame_index),
+                        reference_frames=initial_frames,
+                    )
+                    # _make_frames already consumed frame index 0; initialize from
+                    # those exact frames without constructing them a second time.
+                    results = _run_on_tracker_owner(
+                        self.component.initialize_frames_batch,
+                        initial_frames,
+                        initial_sam3.detections_per_view,
+                        sam3_wall_ms=initial_sam3.wall_ms,
+                        sam3_filter_ms=initial_sam3.filter_cpu_ms,
+                        sam3_counts_per_view=initial_sam3.detections_per_class,
+                    )
+                    self._initialized = True
+                else:
+                    pending_correction = self.sam3_worker.poll()
+                    results = _run_on_tracker_owner(
+                        self.component.process_arrays_batch,
+                        view_inputs,
+                        correction=pending_correction,
+                    )
+                    if pending_correction is not None and results:
+                        if bool(results[0].metadata.get("sam3_correction_applied", False)):
+                            self.node.get_logger().info(
+                                "SAM3 direct correction applied: "
+                                f"reference={pending_correction.frame_index} -> "
+                                f"current={results[0].frame.frame_index}, "
+                                f"sam3_wall={pending_correction.wall_ms:.1f} ms"
+                            )
+                        else:
+                            self.node.get_logger().warning(
+                                "SAM3 result dropped: "
+                                f"reference={pending_correction.frame_index}, "
+                                f"reason={results[0].metadata.get('sam3_correction_drop_reason')}"
+                            )
                 component_ms = self._elapsed_ms(stage_started)
 
-                for camera_name, packet, result in zip(
-                    self.camera_names,
-                    bundle,
-                    results,
-                ):
-                    diagnostics = self.diagnostics[camera_name]
-                    diagnostics.record_worker_stage("component_cpu", component_ms)
-                    diagnostics.record_pipeline_timings(result.timings_ms)
-                    diagnostics.on_processed(keyframe=bool(result.keyframe))
+                if results:
+                    self.batch_diagnostics.record_worker_stage("component", component_ms)
+                    self.batch_diagnostics.record_pipeline_timings(results[0].timings_ms)
+                    self.batch_diagnostics.record_instance_counters(results[0].metadata)
+                    self.batch_diagnostics.on_processed(keyframe=bool(results[0].keyframe))
 
-                    stage_started = time.perf_counter()
-                    messages = self.visualizers[camera_name].build_messages(
-                        result,
-                        packet.color.header.stamp,
+                if self.visualization_enabled:
+                    build_started = time.perf_counter()
+                    built_messages = []
+                    for camera_name, packet, result in zip(self.camera_names, bundle, results):
+                        built_messages.append(
+                            (
+                                self.visualizers[camera_name],
+                                self.visualizers[camera_name].build_messages(
+                                    result, packet.color.header.stamp
+                                ),
+                            )
+                        )
+                    groups = (
+                        _run_on_tracker_owner(self.component.get_last_multiview_instances)
+                        if self.fused_visualizer is not None and results
+                        else []
                     )
-                    diagnostics.record_worker_stage(
-                        "rviz_build_cpu",
-                        self._elapsed_ms(stage_started),
+                    fused_messages = (
+                        self.fused_visualizer.build_messages(
+                            groups, bundle[0].color.header.stamp
+                        )
+                        if self.fused_visualizer is not None and results
+                        else None
+                    )
+                    self.batch_diagnostics.record_worker_stage(
+                        "rviz_build", self._elapsed_ms(build_started)
                     )
 
-                    stage_started = time.perf_counter()
-                    self.visualizers[camera_name].publish_messages(messages)
-                    diagnostics.record_worker_stage(
-                        "ros_publish_cpu",
-                        self._elapsed_ms(stage_started),
+                    publish_started = time.perf_counter()
+                    for visualizer, messages in built_messages:
+                        visualizer.publish_messages(messages)
+                    if self.fused_visualizer is not None and fused_messages is not None:
+                        self.fused_visualizer.publish_messages(fused_messages)
+                    self.batch_diagnostics.record_worker_stage(
+                        "ros_publish", self._elapsed_ms(publish_started)
                     )
-                    diagnostics.on_published()
+                    self.batch_diagnostics.on_published()
+
+                # After frame x has been encoded/cached and published, trigger
+                # sparse SAM3 on that exact synchronized bundle. At most one job
+                # can be outstanding, so detector backlog is impossible.
+                if results and bool(results[0].metadata.get("sam3_refresh_due", False)):
+                    reference_frames = [result.frame for result in results]
+                    fallback_masks = _run_on_tracker_owner(
+                        self.component.fallback_masks_from_results,
+                        results,
+                    )
+                    submitted = self.sam3_worker.submit(
+                        frame_index=int(reference_frames[0].frame_index),
+                        reference_frames=reference_frames,
+                        fallback_masks_per_view=fallback_masks,
+                    )
+                    if submitted:
+                        _run_on_tracker_owner(
+                            self.component.mark_sam3_submitted,
+                            int(reference_frames[0].frame_index),
+                        )
+                        self.node.get_logger().info(
+                            "SAM3 async refresh submitted: "
+                            f"frame={reference_frames[0].frame_index}, "
+                            f"reason={results[0].metadata.get('sam3_refresh_reason')}, "
+                            f"batch={len(reference_frames)}"
+                        )
 
                 became_live = not self._live
             except Exception as error:
-                for diagnostics in self.diagnostics.values():
-                    diagnostics.on_error()
+                self.batch_diagnostics.on_error()
                 self.node.get_logger().error(
                     "EfficientTAM multi-view worker: "
                     f"{type(error).__name__}: {error}\n"
@@ -1309,30 +1300,26 @@ class _MultiViewEfficientTAMWorker:
                 )
             finally:
                 total_ms = self._elapsed_ms(worker_started)
-                for diagnostics in self.diagnostics.values():
-                    diagnostics.record_worker_stage("worker_total_cpu", total_ms)
+                self.batch_diagnostics.record_worker_stage("worker_total", total_ms)
                 if became_live:
                     self._live = True
-                    for diagnostics in self.diagnostics.values():
-                        diagnostics.start_reporting()
+                    self.batch_diagnostics.start_reporting()
                     self.node.get_logger().info(
                         "EfficientTAM tracking LIVE: "
                         f"execution_mode={self.component.execution_mode}, "
                         f"{self.component.execution_description}"
                     )
-                for diagnostics in self.diagnostics.values():
-                    diagnostics.maybe_report(queue_depth=self.queue.qsize())
+                self.batch_diagnostics.maybe_report(queue_depth=self.queue.qsize())
 
     def close(self) -> None:
         self.stop_event.set()
         self.thread.join(timeout=2.0)
-        for diagnostics in self.diagnostics.values():
-            diagnostics.maybe_report(
-                force=True,
-                queue_depth=self.queue.qsize(),
-            )
-        _run_on_gpu_owner(self.component.print_stats)
-        _run_on_gpu_owner(self.component.close)
+        self.batch_diagnostics.maybe_report(
+            force=True, queue_depth=self.queue.qsize()
+        )
+        self.sam3_worker.close()
+        _run_on_tracker_owner(self.component.print_stats)
+        _run_on_tracker_owner(self.component.close)
 
 
 class _CameraOnlyWorker:
@@ -1450,53 +1437,37 @@ class TrackingNode:
             pass
 
         self.node = _Node("sam_rgbd_tracking")
-        backend = str(config.tracker.backend)
-        if backend == "efficient_tam":
-            self.workers = [
-                _MultiViewEfficientTAMWorker(self.node, config)
-            ]
-            execution_mode = str(
-                config.tracker.efficient_tam.get(
-                    "execution_mode",
-                    "sequential",
-                )
-            )
-            max_objects = int(
-                config.tracker.efficient_tam.get(
-                    "max_objects_per_view",
-                    max(1, len(config.detector.get("prompts", []))),
-                )
-            )
-            self.node.get_logger().info(
-                "Tracking "
-                f"cameras={list(config.runtime.camera_names)} "
-                f"backend=efficient_tam execution_mode={execution_mode} "
-                f"max_objects_per_view={max_objects}"
-            )
-        else:
-            # SAM-MT keeps the existing independent per-camera worker path.
-            self.workers = [
-                _CameraWorker(self.node, str(name), config)
-                for name in config.runtime.camera_names
-            ]
-            self.node.get_logger().info(
-                "Tracking "
-                f"cameras={list(config.runtime.camera_names)} "
-                f"backend={backend}"
-            )
+        self.workers = [_MultiViewEfficientTAMWorker(self.node, config)]
+        execution_mode = str(
+            config.tracker.efficient_tam.get("execution_mode", "fixed_batch")
+        )
+        object_slots = object_slots_per_view(config)
+        history = int(config.tracker.efficient_tam.get("feature_history_frames", 32))
+        use_max_autotune = bool(
+            config.tracker.efficient_tam.get("use_max_autotune", False)
+        )
+        visualization_enabled = bool(
+            config.runtime.get("enable_visualization", True)
+        )
+        self.node.get_logger().info(
+            "Tracking "
+            f"cameras={list(config.runtime.camera_names)} "
+            f"backend=efficient_tam execution_mode={execution_mode} "
+            f"object_slots_per_view={object_slots} "
+            f"feature_history_frames={history} "
+            f"compile_mode={'max-autotune' if use_max_autotune else 'default'} "
+            f"visualization={'on' if visualization_enabled else 'off'}"
+        )
 
     def close(self) -> None:
         for worker in self.workers:
             worker.close()
         self.node.destroy_node()
 
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/tracking.yaml")
-    parser.add_argument(
-        "--tracker",
-        choices=("sam_mt", "efficient_tam"),
-    )
     parser.add_argument(
         "--efficient-tam-execution-mode",
         choices=("sequential", "fixed_batch"),
@@ -1520,7 +1491,6 @@ def main() -> None:
     args = parse_args()
     config = load_config(
         args.config,
-        tracker=args.tracker,
         efficient_tam_execution_mode=args.efficient_tam_execution_mode,
     )
     rclpy.init()

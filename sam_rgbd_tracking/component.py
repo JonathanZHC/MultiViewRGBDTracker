@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import copy
 from pathlib import Path
 
 import cv2
@@ -8,6 +9,7 @@ import numpy as np
 from .config import Config, load_config
 from .data_types import (
     CameraIntrinsics,
+    DetectionInstance,
     FrameResult,
     ProcessedInstance,
     RGBDFrame,
@@ -16,34 +18,25 @@ from .data_types import (
     TrackerSeed,
     VisibilityState,
 )
-from .detector import InstanceDetector, build_detector
 from .processing import (
-    associate,
     backproject_mask,
     bbox_3d,
-    blend_embedding,
-    erode_and_filter,
+    erode_filter_and_bbox,
     nonoverlap_owner_map,
     robust_centroid,
     transform_points,
     valid_depth_mask,
+    mask_iou,
 )
 from .profiler import FrameProfiler
-from .trackers import build_tracker
-from .trackers.base import MultiObjectTracker
-
-try:
-    import torch
-except ImportError:  # pragma: no cover
-    torch = None
+from .slots import build_slot_layout
 
 
 class SAMTrackingComponent:
-    """Per-camera SAM3 association and RGB-D post-processing.
+    """Per-view association, RGB-D geometry, and profiling helper.
 
-    2-D masks are depth-independent. Depth is used only for 3-D geometry and
-    the optional centroid cue used during keyframe association. The component
-    can own a tracker or participate in the shared multi-view EfficientTAM path.
+    SAM3 and EfficientTAM are owned by the multi-view orchestration layer. This
+    class intentionally contains no model backend and no GPU model state.
     """
 
     def __init__(
@@ -51,67 +44,23 @@ class SAMTrackingComponent:
         config: str | Path | Config = "configs/tracking.yaml",
         *,
         camera_name: str = "camera_0",
-        backend: str | None = None,
-        detector: InstanceDetector | None = None,
-        tracker: MultiObjectTracker | None = None,
-        build_tracker_backend: bool = True,
     ) -> None:
         if isinstance(config, (str, Path)):
-            config = load_config(config, tracker=backend)
-        elif backend is not None:
-            data = config.as_dict()
-            data["tracker"]["backend"] = backend
-            config = Config(data)
-
+            config = load_config(config)
         self.config = config
         self.camera_name = camera_name
-        self.profiler = FrameProfiler(
-            config,
-            name=f"{camera_name}/{config.tracker.backend}",
-        )
-        self.detector = detector or build_detector(config)
-        if tracker is not None:
-            self.tracker: MultiObjectTracker | None = tracker
-        elif build_tracker_backend:
-            self.tracker = build_tracker(config)
-        else:
-            self.tracker = None
-        if self.tracker is not None and hasattr(self.tracker, "set_profiler"):
-            self.tracker.set_profiler(self.profiler)
-
+        self.profiler = FrameProfiler(config, name=f"{camera_name}/efficient_tam")
+        self.slot_layout = build_slot_layout(config)
         self.tracks: dict[int, TrackState] = {}
-        self.next_track_id = 1
+        self.next_track_id = len(self.slot_layout) + 1
+        self.release_after_missing_frames = max(
+            1, int(config.tracker.get("release_after_missing_frames", 30))
+        )
+        self.local_slot_iou_threshold = float(
+            config.tracker.get("local_slot_iou_threshold", 0.05)
+        )
         self.frame_index = 0
-        self.last_keyframe = -10**9
         self.last_prediction: TrackerPrediction | None = None
-
-        hz = float(config.runtime.target_hz)
-        self.refresh_frames = max(
-            1,
-            int(round(float(config.detector.refresh_seconds) * hz)),
-        )
-        phase_seconds = float(
-            config.detector.phase_offsets_seconds.get(camera_name, 0.0)
-        )
-        self.phase_frames = int(round(phase_seconds * hz))
-        self.min_trigger_gap = int(config.detector.min_frames_between_triggers)
-
-        if (
-            torch is not None
-            and torch.cuda.is_available()
-            and bool(config.runtime.get("enable_tf32", True))
-        ):
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-
-    def prewarm_tracker(self, first_rgb: np.ndarray) -> dict:
-        """Pre-warm backend-specific compiled tracker paths without changing live state."""
-        if self.tracker is None:
-            return {"enabled": False, "performed": False, "reason": "external_tracker"}
-        prewarm = getattr(self.tracker, "prewarm", None)
-        if not callable(prewarm):
-            return {"enabled": False, "performed": False}
-        return dict(prewarm(np.ascontiguousarray(first_rgb, dtype=np.uint8)))
 
     def make_frame(
         self,
@@ -125,11 +74,6 @@ class SAMTrackingComponent:
         timestamp_ns: int = 0,
         world_from_camera: np.ndarray | None = None,
     ) -> RGBDFrame:
-        """Create the next per-view frame without running the tracker.
-
-        The multi-view EfficientTAM coordinator uses this to construct all view
-        frames first, then executes one shared tracking call for the whole bundle.
-        """
         h, w = depth_m.shape
         frame = RGBDFrame(
             camera_name=self.camera_name,
@@ -137,14 +81,7 @@ class SAMTrackingComponent:
             timestamp_ns=int(timestamp_ns),
             rgb=np.ascontiguousarray(rgb, dtype=np.uint8),
             depth_m=np.ascontiguousarray(depth_m, dtype=np.float32),
-            intrinsics=CameraIntrinsics(
-                float(fx),
-                float(fy),
-                float(cx),
-                float(cy),
-                w,
-                h,
-            ),
+            intrinsics=CameraIntrinsics(float(fx), float(fy), float(cx), float(cy), w, h),
             world_from_camera=(
                 None
                 if world_from_camera is None
@@ -154,93 +91,141 @@ class SAMTrackingComponent:
         self.frame_index += 1
         return frame
 
-    def process_arrays(
-        self,
-        rgb: np.ndarray,
-        depth_m: np.ndarray,
-        *,
-        fx: float,
-        fy: float,
-        cx: float,
-        cy: float,
-        timestamp_ns: int = 0,
-        world_from_camera: np.ndarray | None = None,
-    ) -> FrameResult:
-        frame = self.make_frame(
-            rgb,
-            depth_m,
-            fx=fx,
-            fy=fy,
-            cx=cx,
-            cy=cy,
-            timestamp_ns=timestamp_ns,
-            world_from_camera=world_from_camera,
-        )
-        return self.process(frame)
-
-    def process(self, frame: RGBDFrame) -> FrameResult:
-        if self.tracker is None:
-            raise RuntimeError(
-                "This SAMTrackingComponent is attached to an external multi-view "
-                "tracker; call the multi-view coordinator instead of process()."
-            )
-        self.profiler.begin_frame()
-        trigger_reasons: list[str] = []
-        keyframe = self._periodic_keyframe(frame.frame_index)
-
-        if keyframe:
-            trigger_reasons.append("initial" if not self.tracks else "periodic")
-            prediction = self._run_keyframe(frame)
-        else:
-            # Wall-clock call duration is kept separate from internal tracker
-            # stages. Lock waiting is therefore not mislabeled as GPU inference.
-            with self.profiler.stage("tracker_call_wall_cpu", cuda=False):
-                prediction = self.tracker.track(frame)
-            self._update_raw_observations(prediction)
-            if self._anomaly_keyframe(frame.frame_index, prediction):
-                trigger_reasons.append("tracking_anomaly")
-                prediction = self._run_keyframe(frame)
-                keyframe = True
-
-        self.last_prediction = prediction
-        with self.profiler.stage("postprocess_cpu", cuda=False):
-            instances, owner = self._postprocess(frame, prediction)
-
-        timings = self.profiler.end_frame()
-        return FrameResult(
-            frame=frame,
-            instances=instances,
-            owner_track_map=owner,
-            keyframe=keyframe,
-            timings_ms=timings,
-            metadata={"trigger_reasons": trigger_reasons},
-        )
-
-    # ------------------------------------------------------------------
-    # Multi-view coordination helpers
-    # ------------------------------------------------------------------
-
     def begin_external_frame(self) -> None:
         self.profiler.begin_frame()
 
-    def needs_periodic_keyframe(self, frame_index: int) -> bool:
-        return self._periodic_keyframe(frame_index)
-
-    def needs_anomaly_keyframe(
+    def initialize_tracks(
         self,
-        frame_index: int,
-        prediction: TrackerPrediction,
-    ) -> bool:
-        return self._anomaly_keyframe(frame_index, prediction)
+        frame: RGBDFrame,
+        detections: list[DetectionInstance],
+    ) -> list[TrackerSeed]:
+        """Create every configured fixed slot; inactive slots use zero masks."""
+        if self.tracks:
+            raise RuntimeError("initialize_tracks may only be called once")
 
-    def detect_and_seed(self, frame: RGBDFrame) -> list[TrackerSeed]:
-        """Run SAM3 + association for one view, without touching a tracker."""
-        with self.profiler.stage("sam3_total_gpu", cuda=True):
-            detections = self.detector.detect(frame)
-        return self._associate_and_seed(frame, detections)
+        height, width = frame.depth_m.shape
+        detections_by_label: dict[str, list[DetectionInstance]] = {}
+        for detection in detections:
+            detections_by_label.setdefault(detection.label, []).append(detection)
+        for values in detections_by_label.values():
+            values.sort(key=lambda item: float(item.score), reverse=True)
 
-    def mark_keyframe(self, frame_index: int) -> None:
-        self.last_keyframe = int(frame_index)
+        seeds: list[TrackerSeed] = []
+        with self.profiler.stage("sam3_local_slot_assoc_cpu", cuda=False):
+            for spec in self.slot_layout:
+                class_detections = detections_by_label.get(spec.semantic_label, [])
+                detection = (
+                    class_detections[spec.class_slot]
+                    if spec.class_slot < len(class_detections)
+                    else None
+                )
+                active = detection is not None
+                mask = (
+                    np.asarray(detection.mask, dtype=bool).copy()
+                    if detection is not None
+                    else np.zeros((height, width), dtype=bool)
+                )
+                centroid = (
+                    robust_centroid(frame.depth_m, mask, frame.intrinsics)
+                    if active
+                    else None
+                )
+                confidence = float(detection.score) if detection is not None else 0.0
+                self.tracks[spec.track_id] = TrackState(
+                    track_id=spec.track_id,
+                    label=spec.semantic_label,
+                    semantic_confidence=confidence,
+                    tracker_slot=spec.slot_index,
+                    class_slot=spec.class_slot,
+                    active=active,
+                    embedding=None,
+                    last_mask=mask.copy(),
+                    last_raw_mask=mask.copy(),
+                    centroid_camera=centroid,
+                    tracking_confidence=confidence,
+                    missing_frames=0,
+                    last_seen_frame=frame.frame_index if active else -1,
+                )
+                seeds.append(
+                    TrackerSeed(
+                        spec.track_id,
+                        mask,
+                        spec.semantic_label,
+                        confidence,
+                    )
+                )
+        return seeds
+
+    def build_direct_correction_masks(
+        self,
+        reference_frame: RGBDFrame,
+        detections: list[DetectionInstance],
+        expected_track_ids: list[int],
+        fallback_masks: dict[int, np.ndarray],
+    ) -> tuple[list[np.ndarray], int]:
+        """Same-class greedy mask-IoU association onto the fixed local slots."""
+        expected = [int(track_id) for track_id in expected_track_ids]
+        height, width = reference_frame.depth_m.shape
+        masks_by_id: dict[int, np.ndarray] = {}
+        for track_id in expected:
+            fallback = fallback_masks.get(track_id)
+            if fallback is None:
+                fallback = np.zeros((height, width), dtype=bool)
+            masks_by_id[track_id] = np.asarray(fallback, dtype=bool).copy()
+
+        detections_by_label: dict[str, list[DetectionInstance]] = {}
+        for detection in detections:
+            detections_by_label.setdefault(detection.label, []).append(detection)
+        for values in detections_by_label.values():
+            values.sort(key=lambda item: float(item.score), reverse=True)
+
+        activated = 0
+        for label in {spec.semantic_label for spec in self.slot_layout}:
+            class_detections = detections_by_label.get(label, [])
+            class_tracks = [
+                self.tracks[track_id]
+                for track_id in expected
+                if track_id in self.tracks and self.tracks[track_id].label == label
+            ]
+            active_tracks = [track for track in class_tracks if track.active]
+
+            candidate_edges: list[tuple[float, int, int]] = []
+            for det_index, detection in enumerate(class_detections):
+                for track in active_tracks:
+                    iou = mask_iou(masks_by_id[track.track_id], detection.mask)
+                    if iou >= self.local_slot_iou_threshold:
+                        candidate_edges.append((iou, det_index, track.track_id))
+
+            matched_detections: set[int] = set()
+            matched_tracks: set[int] = set()
+            for _, det_index, track_id in sorted(candidate_edges, reverse=True):
+                if det_index in matched_detections or track_id in matched_tracks:
+                    continue
+                detection = class_detections[det_index]
+                masks_by_id[track_id] = np.asarray(detection.mask, dtype=bool).copy()
+                track = self.tracks[track_id]
+                track.semantic_confidence = float(detection.score)
+                track.active = True
+                matched_detections.add(det_index)
+                matched_tracks.add(track_id)
+
+            free_tracks = sorted(
+                (track for track in class_tracks if not track.active),
+                key=lambda track: track.class_slot,
+            )
+            for det_index, detection in enumerate(class_detections):
+                if det_index in matched_detections or not free_tracks:
+                    continue
+                track = free_tracks.pop(0)
+                masks_by_id[track.track_id] = np.asarray(detection.mask, dtype=bool).copy()
+                track.active = True
+                track.semantic_confidence = float(detection.score)
+                track.tracking_confidence = float(detection.score)
+                track.missing_frames = 0
+                track.last_seen_frame = reference_frame.frame_index
+                activated += 1
+
+        return [masks_by_id[track_id] for track_id in expected], activated
 
     def finalize_external_prediction(
         self,
@@ -249,160 +234,47 @@ class SAMTrackingComponent:
         *,
         keyframe: bool,
         trigger_reasons: list[str],
-        update_raw_observations: bool,
+        update_raw_observations: bool = True,
+        extra_metadata: dict | None = None,
     ) -> FrameResult:
-        """Finish one view after a shared multi-view tracker invocation."""
         if update_raw_observations:
             self._update_raw_observations(prediction)
         self.last_prediction = prediction
         with self.profiler.stage("postprocess_cpu", cuda=False):
-            instances, owner = self._postprocess(frame, prediction)
+            (
+                instances,
+                owner,
+                raw_instance_map,
+                filtered_instance_map,
+            ) = self._postprocess(frame, prediction)
         timings = self.profiler.end_frame()
+        metadata = {
+            "trigger_reasons": list(trigger_reasons),
+            "num_active_instances_per_view": sum(
+                1 for track in self.tracks.values() if track.active
+            ),
+            "num_dummy_slots_per_view": sum(
+                1 for track in self.tracks.values() if not track.active
+            ),
+        }
+        if extra_metadata:
+            metadata.update(extra_metadata)
         return FrameResult(
             frame=frame,
             instances=instances,
             owner_track_map=owner,
             keyframe=bool(keyframe),
             timings_ms=timings,
-            metadata={"trigger_reasons": list(trigger_reasons)},
+            raw_instance_map=raw_instance_map,
+            filtered_instance_map=filtered_instance_map,
+            metadata=metadata,
         )
 
-    def _periodic_keyframe(self, frame_index: int) -> bool:
-        if not self.tracks:
-            return True
-        if frame_index - self.last_keyframe < self.min_trigger_gap:
-            return False
-        return (frame_index - self.phase_frames) % self.refresh_frames == 0
-
-    def _anomaly_keyframe(
-        self,
-        frame_index: int,
-        prediction: TrackerPrediction,
-    ) -> bool:
-        if not bool(self.config.detector.trigger_on_anomaly):
-            return False
-        if frame_index - self.last_keyframe < self.min_trigger_gap:
-            return False
-        if prediction.presence_scores.size == 0:
-            return True
-        threshold = float(
-            self.config.detector.get("anomaly_presence_threshold", 0.05)
-        )
-        return bool(float(np.min(prediction.presence_scores)) < threshold)
-
-    def _run_keyframe(self, frame: RGBDFrame) -> TrackerPrediction:
-        with self.profiler.stage("sam3_total_gpu", cuda=True):
-            detections = self.detector.detect(frame)
-        seeds = self._associate_and_seed(frame, detections)
-        with self.profiler.stage("tracker_call_wall_cpu", cuda=False):
-            prediction = self.tracker.correct(frame, seeds)
-        self.last_keyframe = frame.frame_index
-        return prediction
-
-    def _associate_and_seed(
-        self,
-        frame: RGBDFrame,
-        detections,
-    ) -> list[TrackerSeed]:
-        # Depth remains available here only as a 3-D centroid association cue.
-        # It does not affect the detection/tracking masks themselves.
-        centroids = [
-            robust_centroid(frame.depth_m, det.mask, frame.intrinsics)
-            for det in detections
-        ]
-
-        if not self.tracks:
-            seeds: list[TrackerSeed] = []
-            for det, centroid in zip(detections, centroids):
-                track_id = self._new_track_id()
-                self.tracks[track_id] = TrackState(
-                    track_id=track_id,
-                    label=det.label,
-                    semantic_confidence=det.score,
-                    embedding=det.embedding,
-                    last_mask=det.mask.copy(),
-                    last_raw_mask=det.mask.copy(),
-                    centroid_camera=centroid,
-                    last_seen_frame=frame.frame_index,
-                )
-                seeds.append(
-                    TrackerSeed(track_id, det.mask, det.label, det.score)
-                )
-            return seeds
-
-        matches, unmatched_d, unmatched_t = associate(
-            detections,
-            self.tracks,
-            centroids,
-            self.config.association,
-        )
-
-        seeds: list[TrackerSeed] = []
-        for d_idx, track_id in matches:
-            det = detections[d_idx]
-            track = self.tracks[track_id]
-            track.label = det.label
-            track.semantic_confidence = det.score
-            track.embedding = blend_embedding(track.embedding, det.embedding)
-            track.last_raw_mask = (
-                None if track.last_mask is None else track.last_mask.copy()
-            )
-            track.last_mask = det.mask.copy()
-            track.centroid_camera = centroids[d_idx]
-            track.last_seen_frame = frame.frame_index
-            track.missing_frames = 0
-            seeds.append(
-                TrackerSeed(track_id, det.mask, det.label, det.score)
-            )
-
-        for d_idx in sorted(unmatched_d):
-            det = detections[d_idx]
-            track_id = self._new_track_id()
-            self.tracks[track_id] = TrackState(
-                track_id=track_id,
-                label=det.label,
-                semantic_confidence=det.score,
-                embedding=det.embedding,
-                last_mask=det.mask.copy(),
-                last_raw_mask=det.mask.copy(),
-                centroid_camera=centroids[d_idx],
-                last_seen_frame=frame.frame_index,
-            )
-            seeds.append(
-                TrackerSeed(track_id, det.mask, det.label, det.score)
-            )
-
-        ttl = int(self.config.association.lost_ttl_frames)
-        for track_id in unmatched_t:
-            track = self.tracks[track_id]
-            track.missing_frames += 1
-            fallback = (
-                track.last_raw_mask
-                if track.last_raw_mask is not None
-                else track.last_mask
-            )
-            if (
-                track.missing_frames <= ttl
-                and fallback is not None
-                and fallback.any()
-            ):
-                seeds.append(
-                    TrackerSeed(
-                        track_id,
-                        fallback,
-                        track.label,
-                        track.semantic_confidence,
-                    )
-                )
-
-        for track_id in [
-            key
-            for key, value in self.tracks.items()
-            if value.missing_frames > ttl
-        ]:
-            self.tracks.pop(track_id, None)
-
-        return seeds
+    def raw_masks_by_track(self, result: FrameResult) -> dict[int, np.ndarray]:
+        return {
+            int(instance.track_id): np.asarray(instance.raw_mask, dtype=bool).copy()
+            for instance in result.instances
+        }
 
     def _ensure_logits(
         self,
@@ -438,7 +310,7 @@ class SAMTrackingComponent:
             logits = logits[None]
         for channel, track_id in enumerate(prediction.track_ids):
             track = self.tracks.get(int(track_id))
-            if track is None or channel >= logits.shape[0]:
+            if track is None or not track.active or channel >= logits.shape[0]:
                 continue
             track.last_raw_mask = (
                 None if track.last_mask is None else track.last_mask.copy()
@@ -455,15 +327,29 @@ class SAMTrackingComponent:
         self,
         frame: RGBDFrame,
         prediction: TrackerPrediction,
-    ) -> tuple[list[ProcessedInstance], np.ndarray]:
-        """Convert tracker masks to geometry without depth-based mask exclusion."""
+    ) -> tuple[
+        list[ProcessedInstance],
+        np.ndarray,
+        np.ndarray | None,
+        np.ndarray | None,
+    ]:
+        """Convert tracker masks to geometry without depth-based mask exclusion.
+
+        Visualization-only raster products are prepared here once, while masks
+        are already hot in cache.  This avoids rescanning every instance mask in
+        the RViz stage.  They are omitted entirely when visualization is disabled.
+        """
         h, w = frame.depth_m.shape
         logits = self._ensure_logits(prediction, h, w)
 
         valid_channels = [
             index
             for index, value in enumerate(prediction.track_ids)
-            if int(value) in self.tracks and index < logits.shape[0]
+            if (
+                int(value) in self.tracks
+                and self.tracks[int(value)].active
+                and index < logits.shape[0]
+            )
         ]
         track_ids = [
             int(prediction.track_ids[index])
@@ -475,21 +361,42 @@ class SAMTrackingComponent:
             else np.empty((0, h, w), np.float32)
         )
 
+        visualization_enabled = bool(
+            self.config.runtime.get("enable_visualization", True)
+        )
+        debug_images_enabled = visualization_enabled and bool(
+            self.config.runtime.get("publish_debug_images", True)
+        )
+
         if not track_ids:
-            return [], np.zeros((h, w), dtype=np.int32)
+            empty_owner = np.zeros((h, w), dtype=np.int32)
+            filtered_map = (
+                np.zeros((h, w), dtype=np.uint8)
+                if debug_images_enabled
+                else None
+            )
+            raw_map = (
+                np.zeros((h, w), dtype=np.uint8)
+                if debug_images_enabled
+                else None
+            )
+            return [], empty_owner, raw_map, filtered_map
 
         threshold = float(self.config.postprocess.mask_threshold)
 
-        # Mask construction is independent of depth.
-        raw_masks = [logits[channel] > threshold for channel in range(len(track_ids))]
-        final_masks = [
-            erode_and_filter(
-                raw_mask,
+        # Threshold all fixed object channels in one NumPy operation rather than
+        # allocating one temporary threshold result per Python loop iteration.
+        raw_mask_stack = logits > threshold
+        final_masks: list[np.ndarray] = []
+        bboxes_2d: list[tuple[int, int, int, int] | None] = []
+        for channel in range(len(track_ids)):
+            filtered, bbox_2d = erode_filter_and_bbox(
+                raw_mask_stack[channel],
                 int(self.config.postprocess.erosion_pixels),
                 int(self.config.postprocess.min_component_pixels),
             )
-            for raw_mask in raw_masks
-        ]
+            final_masks.append(filtered)
+            bboxes_2d.append(bbox_2d)
 
         # Overlap pixels stay 0 for external ownership/occlusion handling.
         owner_track_map = nonoverlap_owner_map(
@@ -497,6 +404,22 @@ class SAMTrackingComponent:
             track_ids,
             h,
             w,
+        )
+
+        # Build compact visualization maps once in postprocess.  Values are
+        # uint8 per-frame instance codes (1..N), not global track IDs.  The true
+        # ownership map above remains int32/track-ID based.  Using one byte/pixel
+        # cuts debug-raster memory traffic by 4x and feeds OpenCV applyColorMap
+        # directly without conversion.
+        filtered_instance_map = (
+            np.zeros((h, w), dtype=np.uint8)
+            if debug_images_enabled
+            else None
+        )
+        raw_instance_map = (
+            np.zeros((h, w), dtype=np.uint8)
+            if debug_images_enabled
+            else None
         )
 
         # Depth validity affects only 3-D point generation.
@@ -509,8 +432,15 @@ class SAMTrackingComponent:
         processed: list[ProcessedInstance] = []
         for channel, track_id in enumerate(track_ids):
             track = self.tracks[track_id]
-            raw_mask = raw_masks[channel]
+            raw_mask = raw_mask_stack[channel]
             final_mask = final_masks[channel]
+            bbox_2d = bboxes_2d[channel]
+
+            visual_code = np.uint8(min(channel + 1, 255))
+            if filtered_instance_map is not None:
+                filtered_instance_map[final_mask] = visual_code
+            if raw_instance_map is not None:
+                raw_instance_map[raw_mask] = visual_code
 
             geometry_mask = final_mask & valid_geometry_depth
             points_camera, colors = backproject_mask(
@@ -549,18 +479,19 @@ class SAMTrackingComponent:
                     prediction.presence_scores[channel]
                 )
 
-            if final_mask.any():
+            # bbox_2d is already derived from the final filtered mask, so it also
+            # tells us whether the mask is empty without another full-image scan.
+            if bbox_2d is not None:
                 track.last_seen_frame = frame.frame_index
                 track.missing_frames = 0
                 status = VisibilityState.VISIBLE
             else:
                 track.missing_frames += 1
                 status = VisibilityState.LOST
+                if track.missing_frames >= self.release_after_missing_frames:
+                    track.active = False
 
-            # Motion confidence is the tracker confidence; no depth visibility term.
-            motion_conf = float(
-                np.clip(track.tracking_confidence, 0.0, 1.0)
-            )
+            motion_conf = min(max(float(track.tracking_confidence), 0.0), 1.0)
 
             processed.append(
                 ProcessedInstance(
@@ -578,11 +509,19 @@ class SAMTrackingComponent:
                     centroid_world=centroid_world,
                     bbox_min=bounds_min,
                     bbox_max=bounds_max,
+                    bbox_2d_xyxy=bbox_2d,
                     status=status,
+                    tracker_slot=track.tracker_slot,
+                    class_slot=track.class_slot,
                 )
             )
 
-        return processed, owner_track_map
+        return (
+            processed,
+            owner_track_map,
+            raw_instance_map,
+            filtered_instance_map,
+        )
 
     def _new_track_id(self) -> int:
         value = self.next_track_id
@@ -593,5 +532,4 @@ class SAMTrackingComponent:
         self.profiler.print_summary()
 
     def close(self) -> None:
-        if self.tracker is not None:
-            self.tracker.close()
+        return None

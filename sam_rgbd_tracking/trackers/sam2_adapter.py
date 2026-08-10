@@ -24,7 +24,7 @@ except ImportError:  # pragma: no cover
 
 
 class Sam2StyleStreamingTracker(MultiObjectTracker):
-    """Fast live-stream adapter shared by EfficientTAM and SAM2-style trackers.
+    """Fast live-stream adapter used by the EfficientTAM SAM2-style predictor.
 
     CUDAGraph ordering is preserved:
       lock -> append/preprocess -> propagate -> D2H -> unlock
@@ -127,7 +127,7 @@ class Sam2StyleStreamingTracker(MultiObjectTracker):
             GLOBAL_CUDA_LOCK.release()
 
     def _lock(self):
-        # Kept for SAM-MT compatibility with older adapter code.
+        # Backward-compatible alias for the EfficientTAM adapter.
         return GLOBAL_CUDA_LOCK if self.serialize_gpu else nullcontext()
 
     def _autocast(self):

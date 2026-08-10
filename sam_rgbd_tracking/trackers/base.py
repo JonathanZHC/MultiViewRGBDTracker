@@ -7,8 +7,7 @@ from typing import Any, Iterator
 
 from ..data_types import RGBDFrame, TrackerPrediction, TrackerSeed
 
-# SAM3 and all tracker backends share this lock when runtime.serialize_gpu=True.
-# This keeps the two camera workers from interleaving stateful CUDA-graph calls.
+# EfficientTAM may optionally serialize stateful CUDA-graph calls through this lock.
 GLOBAL_CUDA_LOCK = threading.RLock()
 
 # The EfficientTAM memory-attention clone wrapper lives on the shared predictor,
