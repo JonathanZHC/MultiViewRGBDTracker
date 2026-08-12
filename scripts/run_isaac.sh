@@ -7,8 +7,8 @@ SCENE="${1:-dynamic}"
 if [[ $# -gt 0 ]]; then shift; fi
 
 case "${SCENE}" in
-  static|dynamic|hybrid) ;;
-  *) echo "usage: $0 [static|dynamic|hybrid] [extra run_isaacsim.py args...]" >&2; exit 2 ;;
+  static|dynamic|hybrid|occlusion) ;;
+  *) echo "usage: $0 [static|dynamic|hybrid|occlusion] [extra run_isaacsim.py args...]" >&2; exit 2 ;;
 esac
 
 

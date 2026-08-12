@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build tabletop-only static, dynamic and hybrid Isaac Sim scenes.
+"""Build tabletop-only static, dynamic, hybrid and occlusion Isaac Sim scenes.
 
 Every foreground object is a referenced Isaac Sim USD model and every object
 stays on or above the tabletop. The table and ground are the only primitive
@@ -29,11 +29,13 @@ SceneMode = Literal[
     "static",
     "dynamic",
     "hybrid",
+    "occlusion",
 ]
-SCENE_MODES: tuple[str, str, str] = (
+SCENE_MODES: tuple[str, str, str, str] = (
     "static",
     "dynamic",
     "hybrid",
+    "occlusion",
 )
 
 
@@ -111,6 +113,16 @@ HYBRID_STATIC_LAYOUT: tuple[StaticPlacement, ...] = (
     StaticPlacement("mug", (-0.24, -0.34), 24.0),
     StaticPlacement("banana", (0.08, -0.34), -18.0),
     StaticPlacement("pudding_box", (0.34, -0.34), 8.0),
+)
+
+
+# Occlusion mode keeps the food can and mustard bottle stationary behind the
+# panel. The ball is created by MovingObjectController and keeps the exact same
+# dynamic-scene motion profile, but its whole path is translated into this rear
+# row so the moving ball is also occluded by the panel.
+OCCLUSION_STATIC_LAYOUT: tuple[StaticPlacement, ...] = (
+    StaticPlacement("food_can", (-0.38, 0.22), 0.0),
+    StaticPlacement("bottle", (0.00, 0.22), 0.0),
 )
 
 
@@ -515,6 +527,18 @@ def build_scene(
             stage,
             config=config,
             placements=HYBRID_STATIC_LAYOUT,
+        )
+        object_paths.update(
+            static_paths
+        )
+    elif scene_mode == "occlusion":
+        (
+            static_paths,
+            static_footprints,
+        ) = _build_static_assets(
+            stage,
+            config=config,
+            placements=OCCLUSION_STATIC_LAYOUT,
         )
         object_paths.update(
             static_paths

@@ -95,6 +95,35 @@ def class_capacities(config) -> dict[str, int]:
     return dict(prompt_capacities(config))
 
 
+def max_cross_frame_candidate_pairs(config, *, num_views: int | None = None) -> int:
+    """Strict same-class candidate bound after cross-view grouping.
+
+    ``detector.prompts`` gives a per-view physical-instance capacity ``K_c``
+    for each semantic class ``c``. Cross-view alignment intentionally keeps
+    unmatched observations instead of discarding them, so in the worst case
+    every one of the ``V`` views contributes all ``K_c`` observations as
+    separate ``MultiViewInstance`` objects. Both the current and previous
+    frame can therefore contain at most ``V * K_c`` temporal observations for
+    that class.
+
+    Cross-frame matching never compares different semantic classes, hence the
+    strict pair bound is ``sum((V * K_c) ** 2)``. The bound is computed once at
+    initialization and used as the fixed Chamfer pair-workspace capacity.
+
+    ``num_views`` should be the actual runtime view count when available. The
+    configured ``runtime.camera_names`` count is used only as a fallback.
+    """
+    if num_views is None:
+        num_views = len(list(config.runtime.get("camera_names", [])))
+    num_views = int(num_views)
+    if num_views <= 0:
+        raise ValueError("Cross-frame alignment requires at least one camera view")
+    return sum(
+        (num_views * capacity) * (num_views * capacity)
+        for _, capacity in prompt_capacities(config)
+    )
+
+
 def build_slot_layout(config) -> list[SlotSpec]:
     layout: list[SlotSpec] = []
     for label, capacity in prompt_capacities(config):

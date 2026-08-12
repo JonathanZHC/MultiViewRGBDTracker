@@ -10,6 +10,13 @@ Hybrid mode:
 - the shelf and ball move;
 - daily objects from scene_settings.py stay stationary.
 
+Occlusion mode:
+- only the ball moves; its motion profile is exactly the same as dynamic mode
+  (same bounce, oscillation, and yaw), but the whole trajectory is translated
+  behind the foreground panel so the moving ball itself is occluded;
+- the bottle and food can stay stationary behind the same panel;
+- the foreground occluder is animated independently by OcclusionController.
+
 All non-ball objects retain their common authored usage frame. In particular,
 the shelf, bottle, food can and mug remain vertical and receive no roll/pitch.
 
@@ -146,6 +153,30 @@ def _ball_motion(
     )
 
 
+def _occlusion_ball_motion(
+    t: float,
+    surface_z: float,
+) -> MotionPose:
+    """Dynamic-scene ball motion rigidly translated behind the occluder.
+
+    The temporal motion is intentionally unchanged: same 1.2 s parabolic
+    bounce, same 6 s horizontal oscillation, same amplitudes, and same yaw.
+    Only the world-space trajectory center is shifted from roughly
+    (x=0.49, y=-0.10) to (x=0.38, y=0.22), placing the moving ball behind
+    the foreground panel while keeping it separated from the static bottle.
+    """
+
+    base = _ball_motion(t, surface_z)
+    return MotionPose(
+        position_world=(
+            base.position_world[0] - 0.11,
+            base.position_world[1] + 0.32,
+            base.position_world[2],
+        ),
+        rotation_xyz_deg=base.rotation_xyz_deg,
+    )
+
+
 def _bottle_motion(
     t: float,
     surface_z: float,
@@ -265,6 +296,21 @@ HYBRID_MOTIONS: tuple[
 )
 
 
+# Reuse the exact dynamic-scene ball *motion profile* in occlusion mode, but
+# rigidly translate the path behind the occluder so the moving ball itself
+# experiences clear/partial/full/recovery phases.
+OCCLUSION_MOTIONS: tuple[
+    MotionDefinition,
+    ...
+] = (
+    MotionDefinition(
+        name="bouncing_ball",
+        asset_key="ball",
+        trajectory=_occlusion_ball_motion,
+    ),
+)
+
+
 class MovingObjectController:
     """Create, validate and update moving tabletop asset models."""
 
@@ -291,10 +337,11 @@ class MovingObjectController:
         if scene_mode not in (
             "dynamic",
             "hybrid",
+            "occlusion",
         ):
             raise ValueError(
                 "MovingObjectController requires "
-                "'dynamic' or 'hybrid' mode."
+                "'dynamic', 'hybrid' or 'occlusion' mode."
             )
         if speed_scale <= 0.0:
             raise ValueError(
@@ -316,11 +363,12 @@ class MovingObjectController:
             speed_scale
         )
 
-        definitions = (
-            DYNAMIC_MOTIONS
-            if scene_mode == "dynamic"
-            else HYBRID_MOTIONS
-        )
+        if scene_mode == "dynamic":
+            definitions = DYNAMIC_MOTIONS
+        elif scene_mode == "hybrid":
+            definitions = HYBRID_MOTIONS
+        else:
+            definitions = OCCLUSION_MOTIONS
 
         self.objects: dict[
             str,

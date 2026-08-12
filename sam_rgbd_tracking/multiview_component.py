@@ -64,7 +64,7 @@ class MultiViewEfficientTAMComponent:
             len(self.camera_names),
             voxelizer=self.cross_view.voxelizer,
         )
-        self.cross_frame = CrossFrameAligner(config)
+        self.cross_frame = CrossFrameAligner(config, num_views=len(self.camera_names))
         self.last_multiview_instances: list[MultiViewInstance] = []
 
         hz = float(config.runtime.target_hz)
@@ -161,6 +161,7 @@ class MultiViewEfficientTAMComponent:
 
     def _finish_frame(self, results: list[FrameResult]) -> list[FrameResult]:
         timings = self.profiler.end_frame()
+        profiler_warmup_excluded = bool(self.profiler.last_frame_excluded)
         active_per_view = [
             int(result.metadata.get("num_active_instances_per_view", 0))
             for result in results
@@ -173,6 +174,8 @@ class MultiViewEfficientTAMComponent:
             # Every camera belongs to the same synchronized batched execution, so
             # every result carries the same one-per-bundle timing dictionary.
             result.timings_ms = dict(timings)
+            result.metadata["profiling_warmup_excluded"] = profiler_warmup_excluded
+            result.metadata["profiling_warmup_seen"] = int(self.profiler.seen_frames)
             result.metadata["active_instances_per_view"] = active_per_view
             result.metadata["dummy_slots_per_view"] = dummy_per_view
         return results

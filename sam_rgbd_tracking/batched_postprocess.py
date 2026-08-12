@@ -34,6 +34,12 @@ class _MaskRecord:
     final_mask: np.ndarray | None = None
     raw_bbox_2d: tuple[int, int, int, int] | None = None
     bbox_2d: tuple[int, int, int, int] | None = None
+    # Geometry coordinates are extracted once while the cleaned CC ROI is hot.
+    # Geometry consumes these directly instead of rescanning the mask.
+    geometry_y: np.ndarray | None = None
+    geometry_x: np.ndarray | None = None
+    foreground_pixels: int = 0
+    geometry_stride: int = 1
 
 
 @dataclass(slots=True)
@@ -125,15 +131,20 @@ class BatchedPostprocessor:
     def _filter_component_roi_inplace(
         mask_u8: np.ndarray,
         min_component_pixels: int,
-    ) -> tuple[np.ndarray, tuple[int, int, int, int] | None]:
-        """Connected components only inside the nonzero ROI, mutating the mask."""
+    ) -> tuple[np.ndarray, tuple[int, int, int, int] | None, int]:
+        """Filter connected components only inside the nonzero ROI.
+
+        Returns the exact number of retained foreground pixels from CC statistics so
+        later geometry sampling can choose its stride before extracting coordinates.
+        """
         x, y, width, height = cv2.boundingRect(mask_u8)
         if width <= 0 or height <= 0:
             mask_u8.fill(0)
-            return mask_u8, None
+            return mask_u8, None, 0
 
         if min_component_pixels <= 1:
-            return mask_u8, (x, y, x + width - 1, y + height - 1)
+            foreground_pixels = int(cv2.countNonZero(mask_u8[y : y + height, x : x + width]))
+            return mask_u8, (x, y, x + width - 1, y + height - 1), foreground_pixels
 
         roi = mask_u8[y : y + height, x : x + width]
         count, labels, stats, _ = cv2.connectedComponentsWithStats(
@@ -141,7 +152,7 @@ class BatchedPostprocessor:
         )
         if count <= 1:
             mask_u8.fill(0)
-            return mask_u8, None
+            return mask_u8, None, 0
 
         component_ids = np.arange(1, count, dtype=np.int32)
         valid = component_ids[
@@ -149,7 +160,7 @@ class BatchedPostprocessor:
         ]
         if valid.size == 0:
             mask_u8.fill(0)
-            return mask_u8, None
+            return mask_u8, None, 0
 
         keep_lut = np.zeros(count, dtype=np.uint8)
         keep_lut[valid] = 1
@@ -174,7 +185,59 @@ class BatchedPostprocessor:
                 - 1
             ).max()
         )
-        return mask_u8, (x0, y0, x1, y1)
+        foreground_pixels = int(valid_stats[:, cv2.CC_STAT_AREA].sum())
+        return mask_u8, (x0, y0, x1, y1), foreground_pixels
+
+    @staticmethod
+    def _adaptive_geometry_stride(
+        base_stride: int,
+        foreground_pixels: int,
+        max_points: int,
+        enabled: bool,
+    ) -> int:
+        """Choose a larger global-lattice stride before coordinate extraction.
+
+        The cleaned mask itself is unchanged.  The returned stride is always an
+        integer multiple of ``base_stride``, so adaptive sampling remains a subset
+        of the configured global image sampling lattice.
+        """
+        base_stride = max(1, int(base_stride))
+        if not enabled or max_points <= 0 or foreground_pixels <= 0:
+            return base_stride
+        estimated_base_samples = foreground_pixels / float(base_stride * base_stride)
+        if estimated_base_samples <= max_points:
+            return base_stride
+        multiplier = int(np.ceil(np.sqrt(estimated_base_samples / float(max_points))))
+        return base_stride * max(1, multiplier)
+
+    @staticmethod
+    def _sample_geometry_coordinates(
+        mask: np.ndarray,
+        bbox: tuple[int, int, int, int] | None,
+        stride: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Extract compact global (y,x) foreground coordinates once per CC ROI."""
+        if bbox is None:
+            empty = np.empty((0,), dtype=np.int32)
+            return empty, empty.copy()
+        x0, y0, x1, y1 = bbox
+        stride = max(1, int(stride))
+        xs0 = ((x0 + stride - 1) // stride) * stride
+        ys0 = ((y0 + stride - 1) // stride) * stride
+        if xs0 > x1 or ys0 > y1:
+            empty = np.empty((0,), dtype=np.int32)
+            return empty, empty.copy()
+        roi = np.asarray(
+            mask[ys0 : y1 + 1 : stride, xs0 : x1 + 1 : stride],
+            dtype=bool,
+        )
+        local_y, local_x = np.nonzero(roi)
+        if local_y.size == 0:
+            empty = np.empty((0,), dtype=np.int32)
+            return empty, empty.copy()
+        ys = np.asarray(ys0 + local_y * stride, dtype=np.int32)
+        xs = np.asarray(xs0 + local_x * stride, dtype=np.int32)
+        return ys, xs
 
     def _collect_records(
         self,
@@ -260,6 +323,8 @@ class BatchedPostprocessor:
         records: list[_MaskRecord],
         resize_groups: dict[tuple[int, int, int, int], list[int]],
         logits_per_view: list[Any],
+        *,
+        need_raw_masks: bool,
     ) -> list[tuple[_MaskRecord, np.ndarray]]:
         assert torch is not None and F is not None and self.device is not None
         threshold = float(self.config.postprocess.mask_threshold)
@@ -314,16 +379,22 @@ class BatchedPostprocessor:
             else:
                 eroded = raw
 
-            # The only dense mask transfer in the live path.  EfficientTAM logits
-            # never leave CUDA; compact 1-byte binary masks are copied once for
-            # CPU ROI connected-components/RViz.
-            packed = torch.cat((raw, eroded), dim=0).to(torch.uint8).cpu().numpy()
-            count = len(indices)
-            raw_cpu = packed[:count]
-            eroded_cpu = packed[count:]
+            # Normal tracking needs only the cleaned/eroded mask on CPU.  Raw
+            # full-resolution masks are transferred only when they are actually
+            # consumed: debug-image publication or the exact frame submitted to
+            # asynchronous SAM3 as its fallback reference.
+            if need_raw_masks:
+                packed = torch.cat((raw, eroded), dim=0).to(torch.uint8).cpu().numpy()
+                count = len(indices)
+                raw_cpu = packed[:count]
+                eroded_cpu = packed[count:]
+            else:
+                raw_cpu = None
+                eroded_cpu = eroded.to(torch.uint8).cpu().numpy()
             for local_index, record_index in enumerate(indices):
                 record = records[record_index]
-                record.raw_mask = raw_cpu[local_index].view(np.bool_)
+                if raw_cpu is not None:
+                    record.raw_mask = raw_cpu[local_index].view(np.bool_)
                 pending.append((record, eroded_cpu[local_index]))
         return pending
 
@@ -332,6 +403,8 @@ class BatchedPostprocessor:
         records: list[_MaskRecord],
         resize_groups: dict[tuple[int, int, int, int], list[int]],
         logits_per_view: list[np.ndarray],
+        *,
+        need_raw_masks: bool,
     ) -> list[tuple[_MaskRecord, np.ndarray]]:
         """CPU fallback: submit all independent masks as one persistent task batch."""
         threshold = float(self.config.postprocess.mask_threshold)
@@ -364,7 +437,8 @@ class BatchedPostprocessor:
         pending: list[tuple[_MaskRecord, np.ndarray]] = []
         for record, future in jobs:
             raw, eroded = future.result()
-            record.raw_mask = raw
+            if need_raw_masks:
+                record.raw_mask = raw
             pending.append((record, eroded))
         return pending
 
@@ -373,36 +447,70 @@ class BatchedPostprocessor:
         records: list[_MaskRecord],
         resize_groups: dict[tuple[int, int, int, int], list[int]],
         logits_per_view: list[np.ndarray],
+        *,
+        need_raw_masks: bool,
     ) -> list[tuple[_MaskRecord, np.ndarray]]:
         if self.mask_stage_cuda:
-            return self._batch_masks_gpu(records, resize_groups, logits_per_view)
-        return self._batch_masks_cpu(records, resize_groups, logits_per_view)
+            return self._batch_masks_gpu(
+                records, resize_groups, logits_per_view, need_raw_masks=need_raw_masks
+            )
+        return self._batch_masks_cpu(
+            records, resize_groups, logits_per_view, need_raw_masks=need_raw_masks
+        )
 
     @classmethod
     def _filter_record_masks(
         cls,
-        raw_mask: np.ndarray,
+        raw_mask: np.ndarray | None,
         eroded_u8: np.ndarray,
         min_component_pixels: int,
+        base_stride: int,
+        max_points: int,
+        adaptive_sampling: bool,
     ) -> tuple[
         np.ndarray,
         tuple[int, int, int, int] | None,
         tuple[int, int, int, int] | None,
+        np.ndarray,
+        np.ndarray,
+        int,
+        int,
     ]:
-        raw_u8 = np.asarray(raw_mask).view(np.uint8)
-        x, y, width, height = cv2.boundingRect(raw_u8)
-        raw_bbox = (x, y, x + width - 1, y + height - 1) if width and height else None
-        filtered, bbox = cls._filter_component_roi_inplace(
+        raw_bbox = None
+        if raw_mask is not None:
+            raw_u8 = np.asarray(raw_mask).view(np.uint8)
+            x, y, width, height = cv2.boundingRect(raw_u8)
+            if width and height:
+                raw_bbox = (x, y, x + width - 1, y + height - 1)
+
+        filtered, bbox, foreground_pixels = cls._filter_component_roi_inplace(
             eroded_u8, min_component_pixels
         )
-        return filtered, bbox, raw_bbox
+        geometry_stride = cls._adaptive_geometry_stride(
+            base_stride, foreground_pixels, max_points, adaptive_sampling
+        )
+        ys, xs = cls._sample_geometry_coordinates(filtered, bbox, geometry_stride)
+        return (
+            filtered,
+            bbox,
+            raw_bbox,
+            ys,
+            xs,
+            foreground_pixels,
+            geometry_stride,
+        )
 
     def _batch_components(
         self,
         pending: list[tuple[_MaskRecord, np.ndarray]],
     ) -> None:
-        """Run exact connected-components concurrently, only inside each ROI."""
+        """Run CC + compact geometry-coordinate extraction in one ROI pass."""
         min_component_pixels = int(self.config.postprocess.min_component_pixels)
+        base_stride = max(1, int(self.config.pointcloud.stride))
+        max_points = int(self.config.pointcloud.max_points_per_instance)
+        adaptive_sampling = bool(
+            self.config.postprocess.get("adaptive_geometry_sampling", True)
+        )
         jobs = [
             (
                 record,
@@ -411,15 +519,30 @@ class BatchedPostprocessor:
                     record.raw_mask,
                     mask_u8,
                     min_component_pixels,
+                    base_stride,
+                    max_points,
+                    adaptive_sampling,
                 ),
             )
             for record, mask_u8 in pending
         ]
         for record, future in jobs:
-            filtered, bbox, raw_bbox = future.result()
+            (
+                filtered,
+                bbox,
+                raw_bbox,
+                ys,
+                xs,
+                foreground_pixels,
+                geometry_stride,
+            ) = future.result()
             record.final_mask = filtered.view(np.bool_)
             record.bbox_2d = bbox
             record.raw_bbox_2d = raw_bbox
+            record.geometry_y = ys
+            record.geometry_x = xs
+            record.foreground_pixels = int(foreground_pixels)
+            record.geometry_stride = int(geometry_stride)
 
     def _geometry_one(
         self,
@@ -449,29 +572,19 @@ class BatchedPostprocessor:
                 colors_rgb=empty_colors,
             )
 
-        x0, y0, x1, y1 = bbox
-        stride = max(1, int(self.config.pointcloud.stride))
-        # Preserve the old *global* image sampling lattice, even though we only
-        # inspect this ROI.
-        xs0 = ((x0 + stride - 1) // stride) * stride
-        ys0 = ((y0 + stride - 1) // stride) * stride
-        if xs0 > x1 or ys0 > y1:
+        ys = record.geometry_y
+        xs = record.geometry_x
+        if ys is None or xs is None or ys.size == 0:
             return _GeometryRecord(
                 points_camera=empty_points,
                 points_world=(empty_points.copy() if frame.world_from_camera is not None else None),
                 colors_rgb=empty_colors,
             )
 
-        roi = np.asarray(mask[ys0 : y1 + 1 : stride, xs0 : x1 + 1 : stride], dtype=bool)
-        local_y, local_x = np.nonzero(roi)
-        if local_y.size == 0:
-            return _GeometryRecord(
-                points_camera=empty_points,
-                points_world=(empty_points.copy() if frame.world_from_camera is not None else None),
-                colors_rgb=empty_colors,
-            )
-        ys = ys0 + local_y * stride
-        xs = xs0 + local_x * stride
+        # CC already extracted these global coordinates using the configured/adaptive
+        # image lattice. Geometry therefore does no second mask/ROI scan.
+        ys = np.asarray(ys, dtype=np.intp)
+        xs = np.asarray(xs, dtype=np.intp)
 
         z = np.asarray(frame.depth_m[ys, xs], dtype=np.float32)
         min_depth = float(self.config.postprocess.min_valid_depth_m)
@@ -612,6 +725,16 @@ class BatchedPostprocessor:
         debug_images_enabled = visualization_enabled and bool(
             self.config.runtime.get("publish_debug_images", True)
         )
+        # Raw masks are only required by debug rasters or by the exact frame that
+        # is submitted as an asynchronous SAM3 fallback reference. Normal frames
+        # transfer only the eroded mask from CUDA.
+        need_raw_masks = debug_images_enabled or any(
+            bool(metadata.get("sam3_refresh_due", False))
+            for metadata in extra_metadata_per_view
+        )
+        build_owner_map = bool(
+            self.config.postprocess.get("build_owner_map", False)
+        )
 
         with profiler.stage("postprocess_total", cuda=False):
             with profiler.stage(
@@ -621,7 +744,10 @@ class BatchedPostprocessor:
                     views, frames, predictions
                 )
                 pending_components = self._batch_masks(
-                    records, resize_groups, logits_per_view
+                    records,
+                    resize_groups,
+                    logits_per_view,
+                    need_raw_masks=need_raw_masks,
                 )
 
             with profiler.stage("postprocess_components", cuda=False):
@@ -637,7 +763,7 @@ class BatchedPostprocessor:
 
             with profiler.stage("postprocess_finalize", cuda=False):
                 instances_per_view: list[list[ProcessedInstance]] = [[] for _ in views]
-                owner_per_view: list[np.ndarray] = []
+                owner_per_view: list[np.ndarray | None] = []
                 raw_maps: list[np.ndarray | None] = [None] * len(views)
                 filtered_maps: list[np.ndarray | None] = [None] * len(views)
 
@@ -651,7 +777,11 @@ class BatchedPostprocessor:
                 # sentinel; it is converted back to the public 0=unowned value.
                 for view_index, frame in enumerate(frames):
                     h, w = frame.depth_m.shape
-                    owner = np.zeros((h, w), dtype=np.int32)
+                    owner = (
+                        np.zeros((h, w), dtype=np.int32)
+                        if build_owner_map
+                        else None
+                    )
                     raw_map = (
                         np.zeros((h, w), dtype=np.uint8)
                         if debug_images_enabled
@@ -674,10 +804,11 @@ class BatchedPostprocessor:
                             mask_roi = np.asarray(
                                 record.final_mask[rows, cols], dtype=bool
                             )
-                            owner_roi = owner[rows, cols]
-                            empty = owner_roi == 0
-                            owner_roi[mask_roi & empty] = record.track_id
-                            owner_roi[mask_roi & ~empty] = -1
+                            if owner is not None:
+                                owner_roi = owner[rows, cols]
+                                empty = owner_roi == 0
+                                owner_roi[mask_roi & empty] = record.track_id
+                                owner_roi[mask_roi & ~empty] = -1
                             if filtered_map is not None:
                                 filtered_map[rows, cols][mask_roi] = np.uint8(
                                     min(code, 255)
@@ -692,7 +823,8 @@ class BatchedPostprocessor:
                             cols = slice(x0, x1 + 1)
                             raw_roi = np.asarray(record.raw_mask[rows, cols], dtype=bool)
                             raw_map[rows, cols][raw_roi] = np.uint8(min(code, 255))
-                    owner[owner < 0] = 0
+                    if owner is not None:
+                        owner[owner < 0] = 0
                     owner_per_view.append(owner)
                     raw_maps[view_index] = raw_map
                     filtered_maps[view_index] = filtered_map
@@ -704,8 +836,12 @@ class BatchedPostprocessor:
                     track = view.tracks[record.track_id]
                     geom = geometry[record_index]
 
-                    raw_mask = np.asarray(record.raw_mask, dtype=bool)
                     final_mask = np.asarray(record.final_mask, dtype=bool)
+                    raw_mask = (
+                        np.asarray(record.raw_mask, dtype=bool)
+                        if record.raw_mask is not None
+                        else final_mask
+                    )
                     track.last_raw_mask = raw_mask
                     track.last_mask = final_mask
                     track.centroid_camera = geom.centroid_camera

@@ -11,6 +11,7 @@ from scipy.ndimage import maximum_filter
 from scipy.optimize import linear_sum_assignment
 
 from .data_types import FrameResult, MultiViewInstance, ProcessedInstance
+from .slots import max_cross_frame_candidate_pairs
 
 try:
     import torch
@@ -591,46 +592,121 @@ class CrossViewAligner:
 
 
 class _ChamferWorkspace:
-    """Reusable pinned-host + CUDA padded buffers for batched candidate Chamfer."""
+    """Reusable pinned-host + CUDA buffers for per-frame batched Chamfer.
 
-    def __init__(self, device: str, max_workspace_mb: float = 256.0) -> None:
+    The pair dimension is fixed once from the configured per-view semantic
+    capacities and camera count.
+    Point dimensions may still grow geometrically when a larger fused cloud is
+    observed.  This keeps the hot path allocation-free for the expected scene
+    while making a violated instance-capacity assumption fail loudly.
+    """
+
+    def __init__(
+        self,
+        device: str,
+        max_pairs: int,
+        max_workspace_mb: float = 256.0,
+    ) -> None:
         self.device = torch.device(device) if torch is not None else None
+        self.max_pairs = max(1, int(max_pairs))
         self.max_workspace_bytes = max(16, int(max_workspace_mb)) * 1024 * 1024
-        self.capacity = (0, 0, 0)
+        self.capacity = (self.max_pairs, 0, 0)
         self.host_a = None
         self.host_b = None
+        self.host_count_a = None
+        self.host_count_b = None
         self.gpu_a = None
         self.gpu_b = None
+        self.gpu_count_a = None
+        self.gpu_count_b = None
         self.index_a = None
         self.index_b = None
+        self.origin = None
+        self.best_b_sq = None
+        self.total_a = None
+
+    @staticmethod
+    def _grow_points(required: int, current: int) -> int:
+        """Power-of-two growth for point buffers; pair capacity stays fixed."""
+        required = max(1, int(required))
+        current = max(0, int(current))
+        if required <= current:
+            return current
+        return 1 << (required - 1).bit_length()
+
+    def _check_pair_count(self, pairs: int) -> None:
+        if int(pairs) > self.max_pairs:
+            raise RuntimeError(
+                "Cross-frame Chamfer candidate count exceeded the strict "
+                f"multi-view same-class upper bound: got {pairs}, "
+                f"capacity={self.max_pairs}. This bound already accounts for "
+                "all configured cameras and unmatched cross-view observations; "
+                "check detector.prompts capacities or cross-view grouping for "
+                "unexpected duplicate observations."
+            )
+
+    def reserve_points(self, points: int) -> None:
+        """Optionally reserve the expected fused-cloud size at startup."""
+        if torch is None or self.device is None:
+            return
+        if self.device.type == "cuda" and not torch.cuda.is_available():
+            return
+        if points > 0:
+            self._ensure(self.max_pairs, int(points), int(points))
 
     def _ensure(self, pairs: int, max_a: int, max_b: int) -> None:
         if torch is None or self.device is None:
             return
-        old_pairs, old_a, old_b = self.capacity
-        if pairs <= old_pairs and max_a <= old_a and max_b <= old_b:
+        self._check_pair_count(pairs)
+        _, old_a, old_b = self.capacity
+        if max_a <= old_a and max_b <= old_b and self.host_a is not None:
             return
-        new_pairs = max(pairs, old_pairs)
-        new_a = max(max_a, old_a)
-        new_b = max(max_b, old_b)
+
+        new_a = self._grow_points(max_a, old_a)
+        new_b = self._grow_points(max_b, old_b)
         pin = bool(torch.cuda.is_available())
+
+        # Pair capacity is exact and fixed. Point capacity grows only when a larger
+        # fused cloud appears. Padding is intentionally left uninitialized because
+        # count masks make those values semantically irrelevant.
         self.host_a = torch.empty(
-            (new_pairs, new_a, 3), dtype=torch.float32, device="cpu", pin_memory=pin
+            (self.max_pairs, new_a, 3), dtype=torch.float32, device="cpu", pin_memory=pin
         )
         self.host_b = torch.empty(
-            (new_pairs, new_b, 3), dtype=torch.float32, device="cpu", pin_memory=pin
+            (self.max_pairs, new_b, 3), dtype=torch.float32, device="cpu", pin_memory=pin
         )
+        self.host_count_a = torch.empty(
+            (self.max_pairs,), dtype=torch.long, device="cpu", pin_memory=pin
+        )
+        self.host_count_b = torch.empty(
+            (self.max_pairs,), dtype=torch.long, device="cpu", pin_memory=pin
+        )
+
         self.gpu_a = torch.empty(
-            (new_pairs, new_a, 3), dtype=torch.float32, device=self.device
+            (self.max_pairs, new_a, 3), dtype=torch.float32, device=self.device
         )
         self.gpu_b = torch.empty(
-            (new_pairs, new_b, 3), dtype=torch.float32, device=self.device
+            (self.max_pairs, new_b, 3), dtype=torch.float32, device=self.device
         )
-        # Reuse index vectors as well; allocating torch.arange inside every
-        # cdist chunk is measurable when candidate matrices stay tiny.
+        self.gpu_count_a = torch.empty(
+            (self.max_pairs,), dtype=torch.long, device=self.device
+        )
+        self.gpu_count_b = torch.empty(
+            (self.max_pairs,), dtype=torch.long, device=self.device
+        )
+
+        self.origin = torch.empty(
+            (self.max_pairs, 1, 3), dtype=torch.float32, device=self.device
+        )
+        self.best_b_sq = torch.empty(
+            (self.max_pairs, new_b), dtype=torch.float32, device=self.device
+        )
+        self.total_a = torch.empty(
+            (self.max_pairs,), dtype=torch.float32, device=self.device
+        )
         self.index_a = torch.arange(new_a, device=self.device, dtype=torch.long)
         self.index_b = torch.arange(new_b, device=self.device, dtype=torch.long)
-        self.capacity = (new_pairs, new_a, new_b)
+        self.capacity = (self.max_pairs, new_a, new_b)
 
     def _symmetric_gpu(
         self,
@@ -644,25 +720,27 @@ class _ChamferWorkspace:
     ) -> Any:
         """One pairwise-distance pass computes both Chamfer directions.
 
-        We use squared Euclidean distances from batched GEMM, keep only nearest
-        squared distances, and apply sqrt afterwards.  Subtracting one common
-        per-pair origin keeps the dot-product formulation numerically stable for
-        world coordinates while preserving exact pairwise distances.
+        Squared Euclidean distances are formed by batched GEMM. A common
+        per-pair origin improves numerical stability; workspace point buffers are
+        overwritten on the next frame, so the in-place shift adds no allocation.
         """
         pairs = int(a.shape[0])
-        origin = a[:, :1, :].clone()
+        assert self.origin is not None
+        assert self.best_b_sq is not None and self.total_a is not None
+        assert self.index_a is not None and self.index_b is not None
+
+        origin = self.origin[:pairs]
+        origin.copy_(a[:, :1, :])
         a.sub_(origin)
         b.sub_(origin)
+
         target = b[:, :max_b]
         target_sq = (target * target).sum(dim=2)
         valid_b = self.index_b[:max_b][None, :] < count_b[:, None]
-        best_b_sq = torch.full(
-            (pairs, max_b),
-            float("inf"),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        total_a = torch.zeros((pairs,), dtype=torch.float32, device=self.device)
+        best_b_sq = self.best_b_sq[:pairs, :max_b]
+        best_b_sq.fill_(float("inf"))
+        total_a = self.total_a[:pairs]
+        total_a.zero_()
 
         bytes_per_source_point = max(1, pairs * max_b * 4)
         chunk = max(
@@ -674,8 +752,8 @@ class _ChamferWorkspace:
             end = min(max_a, start + chunk)
             source = a[:, start:end]
             source_sq = (source * source).sum(dim=2)
-            # D^2 = ||a||^2 + ||b||^2 - 2 a^T b.  Only one distance
-            # matrix is formed; its row and column minima give both directions.
+            # D^2 = ||a||^2 + ||b||^2 - 2 a^T b. The same matrix supplies
+            # row minima (A->B) and column minima (B->A).
             dist_sq = torch.bmm(source, target_t).mul_(-2.0)
             dist_sq.add_(source_sq[:, :, None])
             dist_sq.add_(target_sq[:, None, :])
@@ -686,11 +764,10 @@ class _ChamferWorkspace:
 
             nearest_a_sq = dist_sq.amin(dim=2)
             nearest_a_sq.masked_fill_(~valid_a, 0.0)
-            total_a += torch.sqrt(nearest_a_sq).sum(dim=1)
+            total_a.add_(torch.sqrt(nearest_a_sq).sum(dim=1))
 
-            # Invalid padded A rows must not contribute to B->A minima.
             dist_sq.masked_fill_(~valid_a[:, :, None], float("inf"))
-            best_b_sq = torch.minimum(best_b_sq, dist_sq.amin(dim=1))
+            torch.minimum(best_b_sq, dist_sq.amin(dim=1), out=best_b_sq)
 
         best_b_sq.masked_fill_(~valid_b, 0.0)
         a_to_b = total_a / count_a.clamp_min(1).to(torch.float32)
@@ -706,6 +783,7 @@ class _ChamferWorkspace:
     ) -> np.ndarray:
         if not pairs:
             return np.empty((0,), dtype=np.float32)
+        self._check_pair_count(len(pairs))
         if (
             torch is None
             or self.device is None
@@ -714,37 +792,47 @@ class _ChamferWorkspace:
         ):
             return self._compute_cpu(pairs)
 
-        counts_a = np.asarray([len(a) for a, _ in pairs], dtype=np.int64)
-        counts_b = np.asarray([len(b) for _, b in pairs], dtype=np.int64)
-        max_a = int(counts_a.max(initial=0))
-        max_b = int(counts_b.max(initial=0))
+        counts_a = [len(a) for a, _ in pairs]
+        counts_b = [len(b) for _, b in pairs]
+        max_a = max(counts_a, default=0)
+        max_b = max(counts_b, default=0)
         if max_a == 0 or max_b == 0:
             return np.full((len(pairs),), np.inf, dtype=np.float32)
 
         self._ensure(len(pairs), max_a, max_b)
         assert self.host_a is not None and self.host_b is not None
+        assert self.host_count_a is not None and self.host_count_b is not None
         assert self.gpu_a is not None and self.gpu_b is not None
-        host_a = self.host_a[: len(pairs), :max_a]
-        host_b = self.host_b[: len(pairs), :max_b]
-        host_a.zero_()
-        host_b.zero_()
+        assert self.gpu_count_a is not None and self.gpu_count_b is not None
+
+        pair_count = len(pairs)
+        host_a = self.host_a[:pair_count, :max_a]
+        host_b = self.host_b[:pair_count, :max_b]
         host_a_np = host_a.numpy()
         host_b_np = host_b.numpy()
         for index, (a, b) in enumerate(pairs):
             host_a_np[index, : len(a)] = np.asarray(a, dtype=np.float32)
             host_b_np[index, : len(b)] = np.asarray(b, dtype=np.float32)
 
-        gpu_a = self.gpu_a[: len(pairs), :max_a]
-        gpu_b = self.gpu_b[: len(pairs), :max_b]
+        host_count_a = self.host_count_a[:pair_count]
+        host_count_b = self.host_count_b[:pair_count]
+        host_count_a.numpy()[:] = counts_a
+        host_count_b.numpy()[:] = counts_b
+
+        gpu_a = self.gpu_a[:pair_count, :max_a]
+        gpu_b = self.gpu_b[:pair_count, :max_b]
+        gpu_count_a = self.gpu_count_a[:pair_count]
+        gpu_count_b = self.gpu_count_b[:pair_count]
         gpu_a.copy_(host_a, non_blocking=host_a.is_pinned())
         gpu_b.copy_(host_b, non_blocking=host_b.is_pinned())
-        count_a_t = torch.as_tensor(counts_a, dtype=torch.long, device=self.device)
-        count_b_t = torch.as_tensor(counts_b, dtype=torch.long, device=self.device)
+        gpu_count_a.copy_(host_count_a, non_blocking=host_count_a.is_pinned())
+        gpu_count_b.copy_(host_count_b, non_blocking=host_count_b.is_pinned())
+
         result = self._symmetric_gpu(
             gpu_a,
             gpu_b,
-            count_a_t,
-            count_b_t,
+            gpu_count_a,
+            gpu_count_b,
             max_a=max_a,
             max_b=max_b,
         )
@@ -779,14 +867,20 @@ class _ChamferWorkspace:
 class CrossFrameAligner:
     """Class+centroid hard gate -> batched Chamfer -> Hungarian."""
 
-    def __init__(self, config) -> None:
+    def __init__(self, config, *, num_views: int | None = None) -> None:
         cfg = config.get("cross_frame_alignment", {})
         self.centroid_gate_m = float(cfg.get("centroid_gate_m", 0.20))
         threshold = cfg.get("max_chamfer_m", None)
         self.max_chamfer_m = None if threshold in (None, "", False) else float(threshold)
         device = str(config.runtime.get("device", "cuda"))
         workspace_mb = float(cfg.get("chamfer_max_workspace_mb", 256.0))
-        self.workspace = _ChamferWorkspace(device, workspace_mb)
+        pair_capacity = max_cross_frame_candidate_pairs(config, num_views=num_views)
+        self.workspace = _ChamferWorkspace(
+            device,
+            max_pairs=pair_capacity,
+            max_workspace_mb=workspace_mb,
+        )
+        self.workspace.reserve_points(int(cfg.get("chamfer_preallocate_points", 0)))
         self.previous: list[MultiViewInstance] = []
         self.next_global_track_id = 1
 

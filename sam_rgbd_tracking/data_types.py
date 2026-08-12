@@ -132,12 +132,12 @@ class MultiViewInstance:
 class FrameResult:
     frame: RGBDFrame
     instances: list[ProcessedInstance]
-    owner_track_map: np.ndarray
+    owner_track_map: np.ndarray | None
     keyframe: bool
     timings_ms: dict[str, float]
-    # Visualization-only compact uint8 instance-code rasters (0=background,
-    # 1..N=current processed-instance order).  True track-ID ownership remains in
-    # owner_track_map.
+    # Optional dense ownership map. The batched fast path disables it by default
+    # because no current downstream consumer reads it. Visualization uses the
+    # compact uint8 instance-code rasters below instead.
     raw_instance_map: np.ndarray | None = None
     filtered_instance_map: np.ndarray | None = None
     metadata: dict[str, Any] = field(default_factory=dict)

@@ -132,6 +132,10 @@ class _RateDiagnostics:
         # Normal tracking stays quiet during model warm-up/initialization.
         # Camera-only mode is diagnostic by definition, so it reports immediately.
         self._reporting_enabled = bool(camera_only)
+        # Normal tracking can suppress all rate/worker/pipeline statistics during
+        # the same warm-up epoch used by FrameProfiler. Camera-only diagnostics
+        # are interactive diagnostics, so they continue to collect immediately.
+        self._statistics_enabled = bool(camera_only)
         self.sync_slop_ms = 1000.0 * float(config.ros.sync_slop_seconds)
 
         self._lock = threading.Lock()
@@ -197,9 +201,22 @@ class _RateDiagnostics:
                 "info": str(info),
             }
 
-    def start_reporting(self) -> None:
-        """Start a fresh live diagnostics epoch."""
+    def start_reporting(self, *, collect_immediately: bool = True) -> None:
+        """Start a fresh live diagnostics epoch.
+
+        When ``collect_immediately`` is false the report clock starts, but all
+        samples/counters remain disabled until ``enable_statistics`` is called.
+        This lets the worker execute real warm-up bundles without contaminating
+        worker/rate statistics.
+        """
         self.reset_all()
+        self._reporting_enabled = True
+        self._statistics_enabled = bool(collect_immediately)
+
+    def enable_statistics(self) -> None:
+        """Begin a fresh measured epoch after runtime warm-up."""
+        self.reset_all()
+        self._statistics_enabled = True
         self._reporting_enabled = True
 
     def reset_all(self) -> None:
@@ -253,7 +270,11 @@ class _RateDiagnostics:
 
     def on_raw_message(self, stream: str, message: Any) -> None:
         """Record every message delivered by one raw message_filters subscriber."""
-        if not self.enabled or not self.camera_enabled:
+        if (
+            not self.enabled
+            or not self.camera_enabled
+            or not self._statistics_enabled
+        ):
             return
         if stream not in self.RAW_STREAMS:
             raise ValueError(f"unknown raw stream: {stream}")
@@ -292,7 +313,7 @@ class _RateDiagnostics:
             self._raw_last_seen_stamp_ns[stream] = stamp_ns
 
     def on_sync_input(self, color: Any, depth: Any, info: Any) -> None:
-        if not self.enabled:
+        if not self.enabled or not self._statistics_enabled:
             return
 
         color_ns = self._stamp_ns(color.header.stamp)
@@ -317,21 +338,21 @@ class _RateDiagnostics:
                     self._sync_skew_samples.setdefault(name, []).append(value)
 
     def on_drop(self, count: int = 1) -> None:
-        if not self.enabled:
+        if not self.enabled or not self._statistics_enabled:
             return
         with self._lock:
             self._window_dropped += int(count)
             self._total_dropped += int(count)
 
     def on_error(self) -> None:
-        if not self.enabled:
+        if not self.enabled or not self._statistics_enabled:
             return
         with self._lock:
             self._window_errors += 1
             self._total_errors += 1
 
     def on_processed(self, *, keyframe: bool) -> None:
-        if not self.enabled:
+        if not self.enabled or not self._statistics_enabled:
             return
         with self._lock:
             self._window_processed += 1
@@ -341,27 +362,27 @@ class _RateDiagnostics:
                 self._total_keyframes += 1
 
     def on_published(self) -> None:
-        if not self.enabled:
+        if not self.enabled or not self._statistics_enabled:
             return
         with self._lock:
             self._window_published += 1
             self._total_published += 1
 
     def record_worker_stage(self, name: str, value_ms: float) -> None:
-        if not self.enabled:
+        if not self.enabled or not self._statistics_enabled:
             return
         with self._lock:
             self._worker_samples.setdefault(name, []).append(float(value_ms))
 
     def record_pipeline_timings(self, timings_ms: dict[str, float]) -> None:
-        if not self.enabled:
+        if not self.enabled or not self._statistics_enabled:
             return
         with self._lock:
             for name, value in timings_ms.items():
                 self._pipeline_samples.setdefault(name, []).append(float(value))
 
     def record_instance_counters(self, metadata: dict[str, Any]) -> None:
-        if not self.enabled:
+        if not self.enabled or not self._statistics_enabled:
             return
         names = (
             "num_active_instances_per_view",
@@ -387,7 +408,11 @@ class _RateDiagnostics:
                 ] = dict(sam3_counts)
 
     def maybe_report(self, *, force: bool = False, queue_depth: int | None = None) -> None:
-        if not self.enabled or not self._reporting_enabled:
+        if (
+            not self.enabled
+            or not self._reporting_enabled
+            or not self._statistics_enabled
+        ):
             return
         now = time.perf_counter()
         with self._lock:
@@ -868,6 +893,11 @@ class _MultiViewEfficientTAMWorker:
         )
         self._live = False
         self._initialized = False
+        self._statistics_warmup_frames = max(
+            0, int(config.profiling.get("warmup_frames", 0))
+        )
+        self._statistics_warmup_seen = 0
+        self._statistics_started = False
 
         # Reuse the small Python orchestration containers every cycle.  Frame
         # arrays themselves are not recycled because asynchronous SAM3 keeps
@@ -1138,6 +1168,7 @@ class _MultiViewEfficientTAMWorker:
 
             worker_started = time.perf_counter()
             became_live = False
+            processed_bundle = False
             self.batch_diagnostics.record_worker_stage(
                 "queue_wait",
                 max(1000.0 * (worker_started - packet.enqueue_wall_s) for packet in bundle),
@@ -1221,6 +1252,7 @@ class _MultiViewEfficientTAMWorker:
                 component_ms = self._elapsed_ms(stage_started)
 
                 if results:
+                    processed_bundle = True
                     self.batch_diagnostics.record_worker_stage("component", component_ms)
                     self.batch_diagnostics.record_pipeline_timings(results[0].timings_ms)
                     self.batch_diagnostics.record_instance_counters(results[0].metadata)
@@ -1303,12 +1335,39 @@ class _MultiViewEfficientTAMWorker:
                 self.batch_diagnostics.record_worker_stage("worker_total", total_ms)
                 if became_live:
                     self._live = True
-                    self.batch_diagnostics.start_reporting()
+                    self.batch_diagnostics.start_reporting(
+                        collect_immediately=self._statistics_warmup_frames == 0
+                    )
+                    self._statistics_started = self._statistics_warmup_frames == 0
                     self.node.get_logger().info(
                         "EfficientTAM tracking LIVE: "
                         f"execution_mode={self.component.execution_mode}, "
-                        f"{self.component.execution_description}"
+                        f"{self.component.execution_description}; "
+                        f"profiling_warmup_frames={self._statistics_warmup_frames}"
                     )
+
+                # Count only successfully completed tracking bundles. Enable rate/
+                # worker statistics *after* the final warm-up bundle has completely
+                # finished, so no decode/component/RViz/publish fragment from that
+                # bundle leaks into the measured epoch. FrameProfiler independently
+                # applies the same warmup_frames value to cumulative stage history.
+                if (
+                    processed_bundle
+                    and self._live
+                    and not self._statistics_started
+                ):
+                    self._statistics_warmup_seen += 1
+                    if (
+                        self._statistics_warmup_seen
+                        >= self._statistics_warmup_frames
+                    ):
+                        self.batch_diagnostics.enable_statistics()
+                        self._statistics_started = True
+                        self.node.get_logger().info(
+                            "Profiling warm-up complete; statistics start now: "
+                            f"excluded_frames={self._statistics_warmup_seen}"
+                        )
+
                 self.batch_diagnostics.maybe_report(queue_depth=self.queue.qsize())
 
     def close(self) -> None:

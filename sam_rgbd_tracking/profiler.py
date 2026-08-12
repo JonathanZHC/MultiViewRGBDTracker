@@ -70,6 +70,12 @@ class FrameProfiler:
         ):
             self.interval = 0
         self.use_cuda_events = bool(config.profiling.get("cuda_events", True))
+        # Runtime frames can still contain one-time CUDA/BLAS/workspace lazy-init
+        # costs after the explicit model pre-warm. Execute those frames normally,
+        # but keep them out of benchmark statistics.
+        self.warmup_frames = max(
+            0, int(config.profiling.get("warmup_frames", 0))
+        )
         raw_csv = str(config.profiling.get("csv_path", ""))
         self.csv_path = Path(raw_csv) if raw_csv else None
         if self.csv_path is not None and name != "tracking":
@@ -83,7 +89,12 @@ class FrameProfiler:
         self._current_cpu: dict[str, float] = {}
         self._current_cuda: dict[str, list[tuple[object, object]]] = {}
         self._frame_start = 0.0
+        # _seen_frames counts every completed runtime frame. _frames counts only
+        # frames admitted to statistics after warm-up.
+        self._seen_frames = 0
         self._frames = 0
+        self._excluded_warmup_frames = 0
+        self._last_frame_excluded = False
         self._lock = threading.Lock()
         self.last_frame: dict[str, float] = {}
 
@@ -150,13 +161,26 @@ class FrameProfiler:
         )
 
         with self._lock:
+            self._seen_frames += 1
+            if self._seen_frames <= self.warmup_frames:
+                # The frame was fully executed (including CUDA synchronization) so
+                # caches/workspaces are genuinely warmed, but it contributes no
+                # samples, CSV row, max/worst frame, or rolling pipeline timing.
+                self._excluded_warmup_frames += 1
+                self._last_frame_excluded = True
+                self.last_frame = {}
+                return {}
+
+            self._last_frame_excluded = False
             self._frames += 1
             for key, value in timings.items():
                 self._history.setdefault(key, []).append(float(value))
-                self._history_frames.setdefault(key, []).append(self._frames)
+                # Keep the original runtime-frame number for "worst" so it stays
+                # easy to correlate with logs even though warm-up was excluded.
+                self._history_frames.setdefault(key, []).append(self._seen_frames)
             self.last_frame = timings
             if self.csv_path is not None:
-                self._append_csv(self._frames, timings)
+                self._append_csv(self._seen_frames, timings)
             if (
                 self.auto_print
                 and self.interval > 0
@@ -205,7 +229,10 @@ class FrameProfiler:
         if not self.enabled or self._frames == 0:
             return
         lines = [
-            f"[Profiler:{self.name}] frames={self._frames}",
+            (
+                f"[Profiler:{self.name}] frames={self._frames}"
+                f" | warmup_excluded={self._excluded_warmup_frames}"
+            ),
             "  "
             f"{'stage':<36} {'n':>6} {'mean':>8} {'median':>8} "
             f"{'p95':>8} {'max':>8} {'worst':>7}",
@@ -229,4 +256,18 @@ class FrameProfiler:
 
     @property
     def frames(self) -> int:
+        """Number of frames included in statistics."""
         return self._frames
+
+    @property
+    def seen_frames(self) -> int:
+        """Number of completed runtime frames, including excluded warm-up."""
+        return self._seen_frames
+
+    @property
+    def warmup_complete(self) -> bool:
+        return self._seen_frames >= self.warmup_frames
+
+    @property
+    def last_frame_excluded(self) -> bool:
+        return self._last_frame_excluded

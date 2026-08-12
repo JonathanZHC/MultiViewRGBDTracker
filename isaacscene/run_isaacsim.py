@@ -13,7 +13,7 @@ WARMUP_FRAMES = 30
 CAMERA_READY_MAX_ATTEMPTS = 60
 CAMERA_READY_LOG_INTERVAL = 10
 ROS_DOMAIN_ID = 117
-SCENE_CHOICES = ("static", "dynamic", "hybrid")
+SCENE_CHOICES = ("static", "dynamic", "hybrid", "occlusion")
 
 
 def parse_args() -> argparse.Namespace:
@@ -95,7 +95,9 @@ def parse_args() -> argparse.Namespace:
             "'dynamic' loads a moving shelf, bouncing/translating ball, "
             "moving bottle, food can and mug; "
             "'hybrid' loads four stationary daily objects plus the moving "
-            "shelf and bouncing ball. Default: static."
+            "shelf and bouncing ball; 'occlusion' loads three tracked rear "
+            "objects plus a large opaque foreground panel that repeatedly "
+            "sweeps through clear/partial/full occlusion. Default: static."
         ),
     )
     parser.add_argument(
@@ -104,7 +106,7 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help=(
             "Multiply all scripted moving-object trajectory speeds. "
-            "Used only by dynamic and hybrid modes. Default: 1.0."
+            "Used by dynamic, hybrid and occlusion modes. Default: 1.0."
         ),
     )
     parser.add_argument(
@@ -196,6 +198,7 @@ from camera_settings import (
     create_cameras,
 )
 from moving_objects import MovingObjectController
+from occlusion_scene import OcclusionController
 from ros_camera_publisher import RosCameraPublisher
 from scene_settings import build_scene
 
@@ -317,6 +320,7 @@ def main() -> None:
     ros_publisher = None
     pyramid_visualizer = None
     moving_object_controller = None
+    occlusion_controller = None
 
     try:
         stage = omni.usd.get_context().get_stage()
@@ -325,13 +329,20 @@ def main() -> None:
             scene_mode=ARGS.scene_mode,
         )
 
-        if ARGS.scene_mode in ("dynamic", "hybrid"):
+        if ARGS.scene_mode in ("dynamic", "hybrid", "occlusion"):
             moving_object_controller = MovingObjectController(
                 stage,
                 scene_mode=ARGS.scene_mode,
                 table_surface_z=scene.table_surface_z,
                 table_half_extent_xy=scene.table_half_extent_xy,
                 static_footprints=scene.static_footprints,
+                speed_scale=ARGS.motion_speed_scale,
+            )
+
+        if ARGS.scene_mode == "occlusion":
+            occlusion_controller = OcclusionController(
+                stage,
+                table_surface_z=scene.table_surface_z,
                 speed_scale=ARGS.motion_speed_scale,
             )
 
@@ -395,11 +406,12 @@ def main() -> None:
             if ARGS.pointcloud_hz == 0.0
             else "separate_full_optical_frame"
         )
-        moving_description = (
-            moving_object_controller.description()
-            if moving_object_controller is not None
-            else "none"
-        )
+        moving_parts: list[str] = []
+        if moving_object_controller is not None:
+            moving_parts.append(moving_object_controller.description())
+        if occlusion_controller is not None:
+            moving_parts.append(occlusion_controller.description())
+        moving_description = ", ".join(moving_parts) or "none"
 
         print(
             "Running forever: "
@@ -417,11 +429,9 @@ def main() -> None:
             f"{ARGS.corrupt and ARGS.depth_corruption}, "
             "depth_encoding=32FC1, "
             f"pointcloud={pointcloud_mode}, "
-            "foreground_geometry=isaac_asset_references, "
-            "all_foreground_objects_on_table=true, "
+            "foreground_geometry=isaac_asset_references_plus_test_fixture, "
             "canonical_usage_frames=true, "
-            "dynamic_shelf=true, "
-            "bouncing_ball=true, "
+            f"occlusion_test={ARGS.scene_mode == 'occlusion'}, "
             "downsampling=false, fusion=false",
             flush=True,
         )
@@ -438,11 +448,12 @@ def main() -> None:
         )
 
         while simulation_app.is_running():
+            motion_now = time.perf_counter()
+            elapsed_motion_s = motion_now - motion_start_time
             if moving_object_controller is not None:
-                motion_now = time.perf_counter()
-                moving_object_controller.update(
-                    motion_now - motion_start_time
-                )
+                moving_object_controller.update(elapsed_motion_s)
+            if occlusion_controller is not None:
+                occlusion_controller.update(elapsed_motion_s)
 
             # Render after updating USD root transforms so captured RGB-D and
             # point clouds contain the current asset positions.
