@@ -1,0 +1,3 @@
+[submodule "isaacscene"]
+	path = isaacscene
+	url = https://github.com/JonathanZHC/isaacscene.git
