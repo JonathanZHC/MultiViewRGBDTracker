@@ -5,6 +5,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE="${IMAGE:-sam-rgbd-tracking:latest}"
 CONTAINER="${CONTAINER:-sam-rgbd-tracking}"
 CACHE_ROOT="${REPO_ROOT}/.container-cache"
+FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS:-LARGE_DATA?max_msg_size=4MB&sockets_size=8MB&non_blocking=true&tcp_negotiation_timeout=50}"
 
 if [[ "$(docker inspect -f '{{.State.Running}}' "${CONTAINER}" 2>/dev/null || true)" == "true" ]]; then
   echo "[OK] container ${CONTAINER} is already running"
@@ -47,6 +48,7 @@ DOCKER_ARGS=(
   -e PRIVACY_CONSENT=Y
   -e "ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-117}"
   -e RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+  -e "FASTDDS_BUILTIN_TRANSPORTS=${FASTDDS_BUILTIN_TRANSPORTS}"
   -e NVIDIA_VISIBLE_DEVICES=all
   -e NVIDIA_DRIVER_CAPABILITIES=all
   -e XDG_RUNTIME_DIR=/tmp/runtime-1234

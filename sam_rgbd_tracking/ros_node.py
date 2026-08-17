@@ -44,12 +44,13 @@ class _RateDiagnostics:
     This helper measures three different layers independently:
 
     1. Raw ROS topic delivery for color, depth, and CameraInfo.
-    2. ApproximateTimeSynchronizer output and timestamp skew.
+    2. Approximate RGB-depth synchronization with cached CameraInfo.
     3. Bounded worker queue, component runtime, and RViz publishing.
 
     Keeping these layers separate is important: a fast tracking pipeline cannot
-    produce 30 Hz if one raw camera topic is slow or if the three header stamps
-    cannot be paired by the synchronizer.
+    produce 30 Hz if one raw camera topic is slow or if RGB/depth cannot be
+    paired within the configured tolerance. CameraInfo is calibration metadata
+    and is therefore cached instead of participating in frame synchronization.
     """
 
     RAW_STREAMS = ("color", "depth", "info")
@@ -581,13 +582,20 @@ class _RateDiagnostics:
                     f"{median:>8.2f} {p95:>8.2f} {maximum:>8.2f}"
                 )
 
-        lines.append(f"  synchronization: slop={self.sync_slop_ms:.2f} ms")
+        lines.append(
+            f"  RGB-D synchronization: slop={self.sync_slop_ms:.2f} ms; "
+            "CameraInfo=cached"
+        )
         ratios = []
-        for stream in self.RAW_STREAMS:
+        for stream in ("color", "depth"):
             raw_count = int(raw[stream]["count"])
             ratio = 100.0 * sync_count / max(1, raw_count)
             ratios.append(f"{stream}={ratio:.1f}% ({sync_count}/{raw_count})")
-        lines.append("    sync/raw: " + " | ".join(ratios))
+        info_count = int(raw["info"]["count"])
+        lines.append(
+            "    sync/raw: " + " | ".join(ratios)
+            + f" | info={info_count} msgs (cached)"
+        )
 
         sync_skew = snapshot["sync_skew"]
         skew_rows = []
@@ -914,6 +922,7 @@ class _MultiViewEfficientTAMWorker:
         self.depth_subs: dict[str, Any] = {}
         self.info_subs: dict[str, Any] = {}
         self.syncs: dict[str, Any] = {}
+        self._latest_info: dict[str, Any] = {}
 
         for camera_name in self.camera_names:
             color_topic = str(config.ros.color_topic).format(camera=camera_name)
@@ -931,20 +940,20 @@ class _MultiViewEfficientTAMWorker:
                 depth_topic,
                 qos_profile=qos_profile_sensor_data,
             )
-            info_sub = message_filters.Subscriber(
-                node,
+            info_sub = node.create_subscription(
                 CameraInfo,
                 info_topic,
-                qos_profile=qos_profile_sensor_data,
+                lambda info, name=camera_name: self._info_callback(name, info),
+                qos_profile_sensor_data,
             )
             sync = message_filters.ApproximateTimeSynchronizer(
-                [color_sub, depth_sub, info_sub],
+                [color_sub, depth_sub],
                 queue_size=max(4, int(config.runtime.queue_size) * 2),
                 slop=float(config.ros.sync_slop_seconds),
             )
             sync.registerCallback(
-                lambda color, depth, info, name=camera_name: self._sync_callback(
-                    name, color, depth, info
+                lambda color, depth, name=camera_name: self._sync_callback(
+                    name, color, depth
                 )
             )
 
@@ -965,7 +974,8 @@ class _MultiViewEfficientTAMWorker:
             f"cameras={self.camera_names}, "
             f"execution_mode={self.component.execution_mode}, "
             f"{self.component.execution_description}; "
-            "waiting for pre-warm/initial SAM3 seed"
+            f"RGB-D slop={1000.0 * float(config.ros.sync_slop_seconds):.1f} ms, "
+            "CameraInfo=cached; waiting for pre-warm/initial SAM3 seed"
         )
 
     @staticmethod
@@ -973,13 +983,22 @@ class _MultiViewEfficientTAMWorker:
         stamp = message.header.stamp
         return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
 
+    def _info_callback(self, camera_name: str, info: Any) -> None:
+        self._latest_info[camera_name] = info
+
     def _sync_callback(
         self,
         camera_name: str,
         color: Any,
         depth: Any,
-        info: Any,
     ) -> None:
+        info = self._latest_info.get(camera_name)
+        if info is None:
+            # Calibration is required before the first RGB-D pair can be used.
+            # Once received, CameraInfo is cached and no longer participates in
+            # the real-time synchronization path.
+            return
+
         packet = _Packet(
             color=color,
             depth=depth,
@@ -1057,7 +1076,12 @@ class _MultiViewEfficientTAMWorker:
                 str(self.config.ros.world_frame),
                 frame_id,
                 Time.from_msg(stamp),
-                timeout=Duration(seconds=0.01),
+                timeout=Duration(
+                    seconds=max(
+                        0.0,
+                        float(self.config.ros.get("tf_timeout_ms", 10.0)),
+                    ) / 1000.0
+                ),
             )
         except Exception:
             return None
@@ -1132,10 +1156,12 @@ class _MultiViewEfficientTAMWorker:
             decode_ms += self._elapsed_ms(stage_started)
 
             intrinsics = packet.info.k
-            frame_id = (
-                packet.color.header.frame_id
-                or f"{camera_name}_optical_frame"
-            )
+            frame_id = str(
+                self.config.ros.get(
+                    "camera_frame",
+                    "{camera}_color_optical_frame",
+                )
+            ).format(camera=camera_name)
             stamp = packet.color.header.stamp
 
             stage_started = time.perf_counter()
@@ -1420,18 +1446,18 @@ class _CameraOnlyWorker:
             depth_topic,
             qos_profile=qos_profile_sensor_data,
         )
-        self.info_sub = message_filters.Subscriber(
-            node,
+        self._latest_info: Any | None = None
+        self.info_sub = node.create_subscription(
             CameraInfo,
             info_topic,
-            qos_profile=qos_profile_sensor_data,
+            self._raw_info_callback,
+            qos_profile_sensor_data,
         )
         self.color_sub.registerCallback(self._raw_color_callback)
         self.depth_sub.registerCallback(self._raw_depth_callback)
-        self.info_sub.registerCallback(self._raw_info_callback)
 
         self.sync = message_filters.ApproximateTimeSynchronizer(
-            [self.color_sub, self.depth_sub, self.info_sub],
+            [self.color_sub, self.depth_sub],
             queue_size=max(4, int(config.runtime.queue_size) * 2),
             slop=float(config.ros.sync_slop_seconds),
         )
@@ -1440,7 +1466,8 @@ class _CameraOnlyWorker:
         self.node.get_logger().info(
             f"{camera_name} CAMERA-ONLY baseline: "
             f"color={color_topic}, depth={depth_topic}, info={info_topic}, "
-            f"sync_slop={1000.0 * float(config.ros.sync_slop_seconds):.1f} ms"
+            f"RGB-D sync_slop={1000.0 * float(config.ros.sync_slop_seconds):.1f} ms, "
+            "CameraInfo=cached"
         )
 
     def _raw_color_callback(self, message: Any) -> None:
@@ -1452,10 +1479,14 @@ class _CameraOnlyWorker:
         self.diagnostics.maybe_report()
 
     def _raw_info_callback(self, message: Any) -> None:
+        self._latest_info = message
         self.diagnostics.on_raw_message("info", message)
         self.diagnostics.maybe_report()
 
-    def _sync_callback(self, color: Any, depth: Any, info: Any) -> None:
+    def _sync_callback(self, color: Any, depth: Any) -> None:
+        info = self._latest_info
+        if info is None:
+            return
         self.diagnostics.on_sync_input(color, depth, info)
         self.diagnostics.maybe_report()
 
@@ -1539,7 +1570,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--camera-only",
         action="store_true",
-        help="Measure raw RGB/depth/CameraInfo and synchronization rates without constructing SAM3 or a tracker.",
+        help="Measure raw RGB/depth/CameraInfo and RGB-D synchronization rates without constructing SAM3 or a tracker.",
     )
     return parser.parse_args()
 
@@ -1560,7 +1591,8 @@ def main() -> None:
         pass
     finally:
         wrapper.close()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

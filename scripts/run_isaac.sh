@@ -25,7 +25,7 @@ docker exec -it "${CONTAINER}" bash -lc "
     --width 640 \\
     --height 480 \\
     --rgbd-hz 30 \\
-    --pointcloud-hz 5 \\
+    --pointcloud-hz 0 \\
     --corrupt \\
     --no-rgb-corruption \\
     --motion-speed-scale 1.0 \\

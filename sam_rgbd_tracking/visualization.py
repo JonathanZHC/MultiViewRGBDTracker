@@ -197,7 +197,9 @@ class RvizPublisher:
         self.node = node
         self.camera_name = camera_name
         self.config = config
-        self._optical_frame = f"{camera_name}_optical_frame"
+        self._optical_frame = str(
+            config.ros.get("camera_frame", "{camera}_color_optical_frame")
+        ).format(camera=camera_name)
         self._world_frame = str(config.ros.world_frame)
         self._debug_images = bool(
             config.runtime.get("publish_debug_images", True)

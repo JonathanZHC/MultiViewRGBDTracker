@@ -2,6 +2,23 @@
 
 EfficientTAM multi-camera RGB-D tracking package used by `SAMTrackingRGBDBenchmark`.
 
+## ROS input contract
+
+The standalone tracker follows the same camera contract as the current IsaacScene and ScenePredictor inputs:
+
+```text
+/camera_i/color/image_raw
+/camera_i/depth/image_raw
+/camera_i/color/camera_info
+TF: world -> camera_i_color_optical_frame
+```
+
+`CameraInfo` is cached as calibration metadata and does not participate in real-time frame synchronization. RGB and depth are paired per camera with `ros.sync_slop_seconds`; the resulting per-camera RGB-D packets are then paired across views with `ros.multiview_sync_slop_seconds`. Camera pose comes exclusively from TF; there is no `/camera_i/pose` dependency.
+
+For the supplied IsaacScene producer, RGB/depth/CameraInfo share the same simulation timestamp. The default local RGB-D slop is still kept at 1 ms so the same standalone tracker also accepts the measured sub-millisecond Orbbec RGB-depth skew. The configured `ros.camera_frame` is the authoritative TF source frame rather than `Image.header.frame_id`.
+
+`scripts/run_isaac.sh` starts IsaacScene with `--pointcloud-hz 0` because this tracker reconstructs instance geometry from RGB-D internally and does not consume IsaacScene's optional `/camera_i/points` topics.
+
 ## Runtime architecture
 
 There is one shared multi-view EfficientTAM tracker and one sparse asynchronous SAM3 worker.
