@@ -669,8 +669,21 @@ class BatchedPostprocessor:
                 record.final_mask = filtered.view(np.bool_)
                 record.bbox_2d = bbox
                 record.raw_bbox_2d = raw_bbox
-                record.geometry_y = None
-                record.geometry_x = None
+
+                # This branch is used when a CPU mask is intentionally
+                # materialized (standalone RViz/debug and occasional refresh
+                # frames).  The fast mask filter only computes bbox/count/stride,
+                # so recover the sparse global-lattice coordinates once here for
+                # the legacy/full geometry materializer.  Normal headless
+                # production frames return through prepare_direct_masks() above
+                # and therefore pay none of this CPU work.
+                record.geometry_y, record.geometry_x = (
+                    self._sample_geometry_coordinates(
+                        record.final_mask,
+                        record.bbox_2d,
+                        int(geometry_stride),
+                    )
+                )
                 record.foreground_pixels = int(foreground_pixels)
                 record.geometry_stride = int(geometry_stride)
             return
