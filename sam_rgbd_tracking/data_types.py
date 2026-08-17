@@ -113,6 +113,16 @@ class ProcessedInstance:
     voxel_colors: np.ndarray | None = None
     voxel_bbox_min: np.ndarray | None = None
     voxel_bbox_max: np.ndarray | None = None
+    # CUDA geometry views retained alongside the compact CPU alignment data.
+    points_camera_gpu: Any | None = None
+    points_world_gpu: Any | None = None
+    voxel_coords_gpu: Any | None = None
+    voxel_keys_gpu: Any | None = None
+    voxel_points_gpu: Any | None = None
+    # Optional CUDA-resident final mask. In lazy-mask mode the NumPy ``mask``
+    # field is intentionally empty on normal frames; downstream visualization
+    # can materialize this tensor on demand, outside the numerical hot path.
+    mask_gpu: Any | None = None
 
 
 @dataclass
@@ -126,6 +136,13 @@ class MultiViewInstance:
     bbox_min: np.ndarray | None
     bbox_max: np.ndarray | None
     global_track_id: int | None = None
+    # Optional zero-copy view into CrossFrameAligner's persistent CUDA bank.
+    # Cross-view fusion remains entirely CPU; this view is attached only after
+    # the fused CPU cloud has already been uploaded for GPU Chamfer.
+    points_world_gpu: Any | None = None
+    # The tracker owner thread and ScenePredictor adapter may use different CUDA
+    # streams. The adapter waits on this event before consuming the bank view.
+    points_world_gpu_ready_event: Any | None = None
 
 
 @dataclass

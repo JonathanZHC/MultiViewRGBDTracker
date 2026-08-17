@@ -10,6 +10,7 @@ There is one shared multi-view EfficientTAM tracker and one sparse asynchronous 
 - `fixed_batch`: one image encoder batch `B=num_views`, then one fixed all-view/object slot batch.
 - `sequential`: the image-feature snapshot remains batched across views while object propagation is B=1 per object.
 - Every EfficientTAM frame stores a persistent image-feature snapshot in a bounded GPU ring.
+- Synchronized camera RGBs share one pinned-host staging tensor and one batched GPU resize/normalize pass before being written into the per-view frame rings.
 - SAM3 runs on a separate persistent worker/CUDA stream and accepts all synchronized camera RGBs in one batch.
 - Only one SAM3 job may be outstanding; new triggers are skipped while SAM3 is busy.
 - When a SAM3 result for historical frame `x` arrives, the next tracker frame `t` can use direct corrected-reference inference: `feature[x] + SAM3 mask[x] + feature[t] -> mask[t]`.
@@ -73,6 +74,8 @@ V=1, capacities=[3,2,1] -> 14
 ```
 
 The exact value is computed once during `CrossFrameAligner` initialization. It is not rounded and the pair dimension is not resized at runtime. The actual number of Chamfer evaluations remains the number of candidates that survive semantic + centroid gating.
+
+The current frame's unique fused clouds are packed/uploaded once into a persistent CUDA bank. At frame end that bank is swapped into the previous-frame role, so the next frame reuses the previous clouds without another H2D transfer. Candidate pairs contain only bank indices; repeated candidates therefore reuse the same resident cloud data.
 
 The point dimension is intentionally different: `chamfer_preallocate_points` is only a startup hint and may grow geometrically when larger fused clouds appear.
 

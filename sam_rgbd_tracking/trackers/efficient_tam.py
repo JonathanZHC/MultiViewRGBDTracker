@@ -16,7 +16,7 @@ except ImportError:  # pragma: no cover
 from ..data_types import TrackerPrediction, TrackerSeed
 from .base import GLOBAL_CUDA_LOCK, current_tracker_profiler
 from .sam2_adapter import Sam2StyleStreamingTracker
-from .streaming_state import StreamingVideoState
+from .streaming_state import BatchedStreamingPreprocessor, StreamingVideoState
 
 
 def _move_rope_frequency_caches_to_device(
@@ -483,6 +483,7 @@ class EfficientTAMMultiViewTracker(EfficientTAMTracker):
         ]
         self._live_prepared = False
         self._feature_snapshots: OrderedDict[int, dict[str, Any]] = OrderedDict()
+        self._batched_preprocessor: BatchedStreamingPreprocessor | None = None
 
         required_api = (
             "snapshot_multiview_image_features",
@@ -607,6 +608,50 @@ class EfficientTAMMultiViewTracker(EfficientTAMTracker):
                 stream = self._new_stream_from_rgb(rgb)
             self.streams[view_idx] = stream
             self._clear_multiview_tags(stream.state)
+
+        # Allocate/reuse the shared hot-path stager during the sparse keyframe
+        # reset instead of paying its one-time allocation on the next live frame.
+        self._ensure_batched_preprocessor()
+
+    def _ensure_batched_preprocessor(
+        self,
+    ) -> BatchedStreamingPreprocessor | None:
+        streams = [stream for stream in self.streams if stream is not None]
+        if len(streams) != self.num_views:
+            return None
+        use_batch = (
+            self.gpu_preprocess
+            and self.num_views > 1
+            and all(stream._gpu_preprocess for stream in streams)
+            and all(stream.storage_device.type == "cuda" for stream in streams)
+        )
+        if not use_batch:
+            return None
+        if (
+            self._batched_preprocessor is None
+            or not self._batched_preprocessor.compatible(streams)
+        ):
+            self._batched_preprocessor = BatchedStreamingPreprocessor(streams)
+        return self._batched_preprocessor
+
+    def _append_synchronized_rgbs(self, rgbs: list[np.ndarray]) -> int:
+        streams = [stream for stream in self.streams if stream is not None]
+        if len(streams) != self.num_views:
+            raise RuntimeError("EfficientTAM multi-view streams are not initialized")
+
+        batch_preprocessor = self._ensure_batched_preprocessor()
+        if batch_preprocessor is not None:
+            return batch_preprocessor.append(streams, rgbs)
+
+        frame_indices = [
+            stream.append(rgb) for stream, rgb in zip(streams, rgbs)
+        ]
+        if len(set(frame_indices)) != 1:
+            raise RuntimeError(
+                "Multi-view streams became misaligned: "
+                f"frame_indices={frame_indices}"
+            )
+        return int(frame_indices[0])
 
     def _prediction_from_view_result(
         self,
@@ -796,16 +841,7 @@ class EfficientTAMMultiViewTracker(EfficientTAMTracker):
         with self._gpu_guard():
             with torch.inference_mode(), self._autocast():
                 states = self._live_states()
-                frame_indices: list[int] = []
-                for stream, rgb in zip(self.streams, rgbs):
-                    assert stream is not None
-                    frame_indices.append(stream.append(rgb))
-                if len(set(frame_indices)) != 1:
-                    raise RuntimeError(
-                        "Multi-view streams became misaligned: "
-                        f"frame_indices={frame_indices}"
-                    )
-                frame_idx = int(frame_indices[0])
+                frame_idx = self._append_synchronized_rgbs(rgbs)
                 source = "propagation"
                 reference_idx: int | None = None
                 reference_snapshot: dict[str, Any] | None = None
@@ -1079,6 +1115,7 @@ class EfficientTAMMultiViewTracker(EfficientTAMTracker):
     def close(self) -> None:
         self._live_prepared = False
         self._feature_snapshots.clear()
+        self._batched_preprocessor = None
         for stream in self.streams:
             if stream is not None:
                 stream.close()

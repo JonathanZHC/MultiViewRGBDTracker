@@ -3,20 +3,11 @@ runtime:
   target_hz: 30.0
   queue_size: 1
   drop_when_busy: true
-
-  # Only one EfficientTAM worker owns tracker state. SAM3 runs on a separate
-  # worker/CUDA stream, so do not serialize both models through the old global lock.
   serialize_gpu: false
   device: cuda
   use_bf16: true
   enable_tf32: true
-
-  # Keep visualization inside the synchronous measured pipeline.  When false,
-  # no RViz messages are built or published.
   enable_visualization: true
-
-  # Debug rasters force raw full-resolution masks to be copied GPU->CPU every
-  # frame. Keep this false for the fast path; set true only when inspecting masks.
   publish_debug_images: false
   
 ros:
@@ -104,6 +95,13 @@ postprocess:
   min_valid_depth_m: 0.10
   max_valid_depth_m: 6.0
 
+  # Frozen CUDA geometry path. Set false only for standalone CPU/debug fallback.
+  gpu_geometry: true
+
+  # Eroded masks and prefetched depth feed the fused Warp
+  # geometry backend directly. Compact voxel D2H and lazy CPU masks are
+  # part of the frozen production implementation.
+
   # Choose a larger point-sampling stride for unusually large masks *before*
   # geometry coordinate extraction. The 2-D cleaned mask itself is unchanged.
   adaptive_geometry_sampling: true
@@ -129,13 +127,7 @@ shared_voxel_grid:
 cross_frame_alignment:
   centroid_gate_m: 0.20
   chamfer_max_workspace_mb: 512
-
-  # Pair capacity is derived automatically from detector.prompts as
-  # sum(class_capacity^2), because cross-frame Chamfer only compares same-class
-  # instances. Point capacity remains a startup hint and may grow if needed.
   chamfer_preallocate_points: 8192
-  # Optional safety threshold; leave unset until measured on your scene.
-  # max_chamfer_m: 0.08
 
 profiling:
   enabled: true
@@ -146,6 +138,8 @@ profiling:
   summary_interval_frames: 100
   cuda_events: true
   csv_path: logs/timing.csv
+  # Buffer profiler CSV rows to avoid per-frame filesystem open/write/close.
+  csv_flush_interval_frames: 100
   rate_diagnostics: true
   camera_diagnostics: true
   rate_summary_interval_seconds: 5.0

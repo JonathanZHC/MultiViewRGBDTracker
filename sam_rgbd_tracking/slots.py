@@ -95,6 +95,21 @@ def class_capacities(config) -> dict[str, int]:
     return dict(prompt_capacities(config))
 
 
+def max_cross_frame_instances(config, *, num_views: int | None = None) -> int:
+    """Strict upper bound on temporal observations after cross-view grouping.
+
+    Cross-view alignment keeps unmatched observations, so in the worst case every
+    configured local slot from every camera survives as a separate
+    ``MultiViewInstance``.  The bound is therefore ``V * sum(K_c)``.
+    """
+    if num_views is None:
+        num_views = len(list(config.runtime.get("camera_names", [])))
+    num_views = int(num_views)
+    if num_views <= 0:
+        raise ValueError("Cross-frame alignment requires at least one camera view")
+    return num_views * sum(capacity for _, capacity in prompt_capacities(config))
+
+
 def max_cross_frame_candidate_pairs(config, *, num_views: int | None = None) -> int:
     """Strict same-class candidate bound after cross-view grouping.
 

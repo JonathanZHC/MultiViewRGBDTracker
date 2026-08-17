@@ -90,7 +90,7 @@ Isaac Sim / sensor publisher : /isaac-sim/python.sh
 SAM tracking                 : /opt/tracking-venv/bin/python
 ```
 
-Do not activate the tracking venv globally inside the Isaac process. The separation is intentional and avoids NumPy/SciPy/Python package conflicts with Isaac Sim.
+Do not activate the tracking venv globally inside the Isaac process. The separation is intentional and avoids NumPy/SciPy/Python package conflicts with Isaac Sim. Warp 1.15.0 is pinned explicitly in both environments; the tracking venv uses it for the fused RGB-D geometry kernels.
 
 ## 2. Start the persistent container
 
@@ -845,3 +845,35 @@ If the parent application already has its own dedicated GPU worker thread, keep 
 - Isaac and tracking intentionally use different Python interpreters.
 - EfficientTAM owns the persistent multi-view tracking state; SAM3 is a sparse asynchronous segmentation refresh rather than an every-frame detector.
 - Cross-view matching is a merge enhancement, not a visibility consensus requirement: unmatched camera observations are retained.
+
+### Frozen GPU geometry fast path
+
+`postprocess.gpu_geometry: true` selects the validated production CUDA path.
+Mask resize/threshold/erosion stays on GPU, depth is prefetched while
+EfficientTAM runs, Warp performs sparse RGB-D/world geometry and deterministic
+voxel representative selection, and CPU alignment receives only compact voxel
+data on normal frames. Full CPU masks are materialized only for visualization,
+debug output, or the SAM3 refresh frame that needs them.
+
+Cross-view matching/fusion and Hungarian assignment remain on CPU. Cross-frame
+Chamfer uses a persistent CUDA cloud bank; the same already-uploaded bank is
+exported as a zero-copy view for an in-process ScenePredictor consumer. The
+failed GPU cross-view-fusion/alignment experiments are not part of the frozen
+implementation.
+
+The former independent experimental switches for direct geometry, compact D2H, depth
+prefetch, lazy masks, and GPU-bank reuse were removed. `gpu_geometry: false` is
+kept only as a standalone/debug fallback.
+
+Typical fast configuration:
+
+```yaml
+runtime:
+  enable_visualization: false
+  publish_debug_images: false
+
+postprocess:
+  gpu_geometry: true
+  adaptive_geometry_sampling: true
+  build_owner_map: false
+```

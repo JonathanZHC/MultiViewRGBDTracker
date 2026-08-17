@@ -22,6 +22,7 @@ ARG TRACKING_TORCH_VERSION=2.8.0
 ARG TRACKING_TORCHVISION_VERSION=0.23.0
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
 ARG WARP_VERSION=1.15.0
+ARG PIP_VERSION=25.1.1
 
 ARG SAM3_REPOSITORY=https://github.com/facebookresearch/sam3.git
 ARG SAM3_REF=main
@@ -127,9 +128,8 @@ PY
 # -----------------------------------------------------------------------------
 
 RUN python3.12 -m venv /opt/tracking-venv \
-    && /opt/tracking-venv/bin/python -m pip install --no-cache-dir --upgrade pip \
-    && /opt/tracking-venv/bin/python -m pip install --no-cache-dir \
-      "setuptools>=75,<81" "wheel>=0.45,<1" \
+    && /opt/tracking-venv/bin/python -m pip install --no-cache-dir --upgrade \
+      "pip==${PIP_VERSION}" "setuptools>=75,<81" "wheel>=0.45,<1" \
     && /opt/tracking-venv/bin/python -m pip install --no-cache-dir \
       torch==${TRACKING_TORCH_VERSION} \
       torchvision==${TRACKING_TORCHVISION_VERSION} \
@@ -160,7 +160,8 @@ RUN python3.12 -m venv /opt/tracking-venv \
       "pycocotools>=2.0.8,<3" \
       "decord==0.6.0" \
       "scikit-image>=0.24" \
-      "scikit-learn>=1.5"
+      "scikit-learn>=1.5" \
+      "warp-lang==${WARP_VERSION}"
 
 # -----------------------------------------------------------------------------
 # Upstream model repositories.
@@ -197,6 +198,7 @@ import matplotlib
 import numpy
 import rclpy
 import torch
+import warp
 import sam3
 import efficient_track_anything
 
@@ -227,6 +229,9 @@ if missing:
     )
 
 print("tracking dependencies OK")
+print("warp", warp.__version__)
+if warp.__version__ != "1.15.0":
+    raise RuntimeError(f"Unexpected Warp version: {warp.__version__}")
 print("torch", torch.__version__, "cuda", torch.version.cuda)
 print("numpy", numpy.__version__, "opencv", cv2.__version__)
 print("matplotlib", matplotlib.__version__)
@@ -252,6 +257,7 @@ fi
 
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-117}"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
+export FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS:-LARGE_DATA?max_msg_size=4MB&sockets_size=8MB&non_blocking=true&tcp_negotiation_timeout=50}"
 
 exec "$@"
 EOF_ENTRYPOINT

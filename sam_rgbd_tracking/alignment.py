@@ -11,7 +11,7 @@ from scipy.ndimage import maximum_filter
 from scipy.optimize import linear_sum_assignment
 
 from .data_types import FrameResult, MultiViewInstance, ProcessedInstance
-from .slots import max_cross_frame_candidate_pairs
+from .slots import max_cross_frame_candidate_pairs, max_cross_frame_instances
 
 try:
     import torch
@@ -592,42 +592,73 @@ class CrossViewAligner:
 
 
 class _ChamferWorkspace:
-    """Reusable pinned-host + CUDA buffers for per-frame batched Chamfer.
+    """Persistent unique-cloud GPU banks plus reusable batched Chamfer buffers.
 
-    The pair dimension is fixed once from the configured per-view semantic
-    capacities and camera count.
-    Point dimensions may still grow geometrically when a larger fused cloud is
-    observed.  This keeps the hot path allocation-free for the expected scene
-    while making a violated instance-capacity assumption fail loudly.
+    Current-frame fused clouds are packed/uploaded exactly once.  The previous
+    frame stays resident on CUDA and becomes the temporal reference by swapping
+    the two banks at frame end.  Candidate pairs carry only (current, previous)
+    indices; pair-shaped tensors are populated by device-to-device gathers, so a
+    cloud participating in several candidates is never uploaded several times.
     """
 
     def __init__(
         self,
         device: str,
         max_pairs: int,
+        max_instances: int,
         max_workspace_mb: float = 256.0,
     ) -> None:
         self.device = torch.device(device) if torch is not None else None
         self.max_pairs = max(1, int(max_pairs))
+        self.max_instances = max(1, int(max_instances))
         self.max_workspace_bytes = max(16, int(max_workspace_mb)) * 1024 * 1024
-        self.capacity = (self.max_pairs, 0, 0)
-        self.host_a = None
-        self.host_b = None
-        self.host_count_a = None
-        self.host_count_b = None
-        self.gpu_a = None
-        self.gpu_b = None
-        self.gpu_count_a = None
-        self.gpu_count_b = None
+        self.point_capacity = 0
+
+        self.host_current = None
+        self.host_previous = None
+        self.host_current_count = None
+        self.host_previous_count = None
+        self.gpu_current = None
+        self.gpu_previous = None
+        self.gpu_current_count = None
+        self.gpu_previous_count = None
+
+        self.pair_a = None
+        self.pair_b = None
+        self.pair_count_a = None
+        self.pair_count_b = None
+        self.host_pair_current = None
+        self.host_pair_previous = None
+        self.gpu_pair_current = None
+        self.gpu_pair_previous = None
+
         self.index_a = None
         self.index_b = None
         self.origin = None
         self.best_b_sq = None
         self.total_a = None
 
+        self.current_size = 0
+        self.previous_size = 0
+        self.current_counts_np = np.empty((0,), dtype=np.int64)
+        self.previous_counts_np = np.empty((0,), dtype=np.int64)
+        # Two reusable events follow the two ping-pong GPU banks. They provide a
+        # stream dependency from the tracker-owner H2D upload to the
+        # ScenePredictor adapter without a host synchronize.
+        self.current_ready_event = None
+        self.previous_ready_event = None
+
+    @property
+    def cuda_enabled(self) -> bool:
+        return bool(
+            torch is not None
+            and self.device is not None
+            and self.device.type == "cuda"
+            and torch.cuda.is_available()
+        )
+
     @staticmethod
     def _grow_points(required: int, current: int) -> int:
-        """Power-of-two growth for point buffers; pair capacity stays fixed."""
         required = max(1, int(required))
         current = max(0, int(current))
         if required <= current:
@@ -639,59 +670,90 @@ class _ChamferWorkspace:
             raise RuntimeError(
                 "Cross-frame Chamfer candidate count exceeded the strict "
                 f"multi-view same-class upper bound: got {pairs}, "
-                f"capacity={self.max_pairs}. This bound already accounts for "
-                "all configured cameras and unmatched cross-view observations; "
-                "check detector.prompts capacities or cross-view grouping for "
-                "unexpected duplicate observations."
+                f"capacity={self.max_pairs}."
+            )
+
+    def _check_instance_count(self, count: int) -> None:
+        if int(count) > self.max_instances:
+            raise RuntimeError(
+                "Cross-frame instance count exceeded the strict configured "
+                f"multi-view slot bound: got {count}, capacity={self.max_instances}."
             )
 
     def reserve_points(self, points: int) -> None:
-        """Optionally reserve the expected fused-cloud size at startup."""
-        if torch is None or self.device is None:
-            return
-        if self.device.type == "cuda" and not torch.cuda.is_available():
-            return
-        if points > 0:
-            self._ensure(self.max_pairs, int(points), int(points))
+        if self.cuda_enabled and points > 0:
+            self._ensure_point_capacity(int(points))
 
-    def _ensure(self, pairs: int, max_a: int, max_b: int) -> None:
-        if torch is None or self.device is None:
-            return
-        self._check_pair_count(pairs)
-        _, old_a, old_b = self.capacity
-        if max_a <= old_a and max_b <= old_b and self.host_a is not None:
-            return
-
-        new_a = self._grow_points(max_a, old_a)
-        new_b = self._grow_points(max_b, old_b)
+    def _allocate_bank(self, points: int):
+        assert torch is not None and self.device is not None
         pin = bool(torch.cuda.is_available())
+        host = torch.empty(
+            (self.max_instances, points, 3),
+            dtype=torch.float32,
+            device="cpu",
+            pin_memory=pin,
+        )
+        host_count = torch.empty(
+            (self.max_instances,), dtype=torch.long, device="cpu", pin_memory=pin
+        )
+        gpu = torch.empty(
+            (self.max_instances, points, 3), dtype=torch.float32, device=self.device
+        )
+        gpu_count = torch.empty(
+            (self.max_instances,), dtype=torch.long, device=self.device
+        )
+        return host, host_count, gpu, gpu_count
 
-        # Pair capacity is exact and fixed. Point capacity grows only when a larger
-        # fused cloud appears. Padding is intentionally left uninitialized because
-        # count masks make those values semantically irrelevant.
-        self.host_a = torch.empty(
-            (self.max_pairs, new_a, 3), dtype=torch.float32, device="cpu", pin_memory=pin
-        )
-        self.host_b = torch.empty(
-            (self.max_pairs, new_b, 3), dtype=torch.float32, device="cpu", pin_memory=pin
-        )
-        self.host_count_a = torch.empty(
-            (self.max_pairs,), dtype=torch.long, device="cpu", pin_memory=pin
-        )
-        self.host_count_b = torch.empty(
-            (self.max_pairs,), dtype=torch.long, device="cpu", pin_memory=pin
-        )
+    def _ensure_point_capacity(self, required: int) -> None:
+        if not self.cuda_enabled:
+            return
+        if required <= self.point_capacity and self.gpu_current is not None:
+            return
 
-        self.gpu_a = torch.empty(
-            (self.max_pairs, new_a, 3), dtype=torch.float32, device=self.device
+        old_previous = self.gpu_previous
+        old_previous_count = self.gpu_previous_count
+        old_capacity = self.point_capacity
+        previous_size = self.previous_size
+
+        new_points = self._grow_points(required, self.point_capacity)
+        (
+            self.host_current,
+            self.host_current_count,
+            self.gpu_current,
+            self.gpu_current_count,
+        ) = self._allocate_bank(new_points)
+        (
+            self.host_previous,
+            self.host_previous_count,
+            self.gpu_previous,
+            self.gpu_previous_count,
+        ) = self._allocate_bank(new_points)
+
+        assert torch is not None and self.device is not None
+        self.pair_a = torch.empty(
+            (self.max_pairs, new_points, 3), dtype=torch.float32, device=self.device
         )
-        self.gpu_b = torch.empty(
-            (self.max_pairs, new_b, 3), dtype=torch.float32, device=self.device
+        self.pair_b = torch.empty(
+            (self.max_pairs, new_points, 3), dtype=torch.float32, device=self.device
         )
-        self.gpu_count_a = torch.empty(
+        self.pair_count_a = torch.empty(
             (self.max_pairs,), dtype=torch.long, device=self.device
         )
-        self.gpu_count_b = torch.empty(
+        self.pair_count_b = torch.empty(
+            (self.max_pairs,), dtype=torch.long, device=self.device
+        )
+
+        pin = bool(torch.cuda.is_available())
+        self.host_pair_current = torch.empty(
+            (self.max_pairs,), dtype=torch.long, device="cpu", pin_memory=pin
+        )
+        self.host_pair_previous = torch.empty(
+            (self.max_pairs,), dtype=torch.long, device="cpu", pin_memory=pin
+        )
+        self.gpu_pair_current = torch.empty(
+            (self.max_pairs,), dtype=torch.long, device=self.device
+        )
+        self.gpu_pair_previous = torch.empty(
             (self.max_pairs,), dtype=torch.long, device=self.device
         )
 
@@ -699,14 +761,113 @@ class _ChamferWorkspace:
             (self.max_pairs, 1, 3), dtype=torch.float32, device=self.device
         )
         self.best_b_sq = torch.empty(
-            (self.max_pairs, new_b), dtype=torch.float32, device=self.device
+            (self.max_pairs, new_points), dtype=torch.float32, device=self.device
         )
         self.total_a = torch.empty(
             (self.max_pairs,), dtype=torch.float32, device=self.device
         )
-        self.index_a = torch.arange(new_a, device=self.device, dtype=torch.long)
-        self.index_b = torch.arange(new_b, device=self.device, dtype=torch.long)
-        self.capacity = (self.max_pairs, new_a, new_b)
+        self.index_a = torch.arange(new_points, device=self.device, dtype=torch.long)
+        self.index_b = torch.arange(new_points, device=self.device, dtype=torch.long)
+        self.point_capacity = new_points
+
+        # Point-capacity growth is rare (normally covered by startup reserve).
+        # Preserve the resident previous frame with one D2D copy so growth does
+        # not change temporal matching semantics.
+        if old_previous is not None and previous_size > 0 and old_capacity > 0:
+            keep_points = min(old_capacity, new_points)
+            self.gpu_previous[:previous_size, :keep_points].copy_(
+                old_previous[:previous_size, :keep_points]
+            )
+            if old_previous_count is not None:
+                self.gpu_previous_count[:previous_size].copy_(
+                    old_previous_count[:previous_size]
+                )
+
+    def _ensure_ready_events(self) -> None:
+        if not self.cuda_enabled or self.current_ready_event is not None:
+            return
+        assert torch is not None and self.device is not None
+        with torch.cuda.device(self.device):
+            self.current_ready_event = torch.cuda.Event(
+                enable_timing=False, blocking=False
+            )
+            self.previous_ready_event = torch.cuda.Event(
+                enable_timing=False, blocking=False
+            )
+
+    def current_cloud_views(self):
+        """Return exact current-cloud CUDA views plus their upload-ready event."""
+        if not self.cuda_enabled or self.gpu_current is None:
+            return [], None
+        views = [
+            self.gpu_current[index, : int(count)]
+            for index, count in enumerate(self.current_counts_np)
+        ]
+        return views, self.current_ready_event
+
+    def stage_current(self, clouds: list[np.ndarray]) -> None:
+        """Pack each unique current fused cloud once and upload one bank."""
+        if not self.cuda_enabled:
+            return
+        self._check_instance_count(len(clouds))
+        self._ensure_ready_events()
+        counts = np.asarray([len(cloud) for cloud in clouds], dtype=np.int64)
+        max_points = int(counts.max(initial=0))
+        self._ensure_point_capacity(max(1, max_points))
+
+        assert self.host_current is not None and self.host_current_count is not None
+        assert self.gpu_current is not None and self.gpu_current_count is not None
+        current_size = len(clouds)
+        host_np = self.host_current.numpy()
+        for index, cloud in enumerate(clouds):
+            count = int(counts[index])
+            if count:
+                host_np[index, :count] = np.asarray(cloud, dtype=np.float32)
+        if current_size:
+            self.host_current_count[:current_size].numpy()[:] = counts
+            used_points = max(1, max_points)
+            host = self.host_current[:current_size, :used_points]
+            gpu = self.gpu_current[:current_size, :used_points]
+            gpu.copy_(host, non_blocking=host.is_pinned())
+            host_count = self.host_current_count[:current_size]
+            self.gpu_current_count[:current_size].copy_(
+                host_count, non_blocking=host_count.is_pinned()
+            )
+
+        self.current_size = current_size
+        self.current_counts_np = counts
+        if current_size and self.current_ready_event is not None:
+            assert self.device is not None
+            self.current_ready_event.record(torch.cuda.current_stream(self.device))
+
+    def promote_current(self) -> None:
+        """Make the just-uploaded current bank the next frame's resident previous."""
+        if not self.cuda_enabled:
+            return
+        self.host_current, self.host_previous = self.host_previous, self.host_current
+        self.host_current_count, self.host_previous_count = (
+            self.host_previous_count,
+            self.host_current_count,
+        )
+        self.gpu_current, self.gpu_previous = self.gpu_previous, self.gpu_current
+        self.gpu_current_count, self.gpu_previous_count = (
+            self.gpu_previous_count,
+            self.gpu_current_count,
+        )
+        self.current_ready_event, self.previous_ready_event = (
+            self.previous_ready_event,
+            self.current_ready_event,
+        )
+        self.previous_size = self.current_size
+        self.previous_counts_np = self.current_counts_np
+        self.current_size = 0
+        self.current_counts_np = np.empty((0,), dtype=np.int64)
+
+    def clear_previous(self) -> None:
+        self.previous_size = 0
+        self.current_size = 0
+        self.previous_counts_np = np.empty((0,), dtype=np.int64)
+        self.current_counts_np = np.empty((0,), dtype=np.int64)
 
     def _symmetric_gpu(
         self,
@@ -718,12 +879,6 @@ class _ChamferWorkspace:
         max_a: int,
         max_b: int,
     ) -> Any:
-        """One pairwise-distance pass computes both Chamfer directions.
-
-        Squared Euclidean distances are formed by batched GEMM. A common
-        per-pair origin improves numerical stability; workspace point buffers are
-        overwritten on the next frame, so the in-place shift adds no allocation.
-        """
         pairs = int(a.shape[0])
         assert self.origin is not None
         assert self.best_b_sq is not None and self.total_a is not None
@@ -752,8 +907,6 @@ class _ChamferWorkspace:
             end = min(max_a, start + chunk)
             source = a[:, start:end]
             source_sq = (source * source).sum(dim=2)
-            # D^2 = ||a||^2 + ||b||^2 - 2 a^T b. The same matrix supplies
-            # row minima (A->B) and column minima (B->A).
             dist_sq = torch.bmm(source, target_t).mul_(-2.0)
             dist_sq.add_(source_sq[:, :, None])
             dist_sq.add_(target_sq[:, None, :])
@@ -777,69 +930,91 @@ class _ChamferWorkspace:
         )
         return 0.5 * (a_to_b + b_to_a)
 
-    def compute(
-        self,
-        pairs: list[tuple[np.ndarray, np.ndarray]],
-    ) -> np.ndarray:
-        if not pairs:
+    def compute_indices(self, candidate_indices: np.ndarray) -> np.ndarray:
+        """Compute Chamfer for candidate bank indices with no repeated H2D clouds."""
+        candidate_indices = np.asarray(candidate_indices, dtype=np.int64)
+        if candidate_indices.size == 0:
             return np.empty((0,), dtype=np.float32)
-        self._check_pair_count(len(pairs))
-        if (
-            torch is None
-            or self.device is None
-            or self.device.type != "cuda"
-            or not torch.cuda.is_available()
-        ):
-            return self._compute_cpu(pairs)
+        if candidate_indices.ndim != 2 or candidate_indices.shape[1] != 2:
+            raise ValueError("candidate_indices must have shape [P, 2]")
+        pair_count = int(candidate_indices.shape[0])
+        self._check_pair_count(pair_count)
+        if not self.cuda_enabled:
+            raise RuntimeError("compute_indices requires CUDA")
+        if self.current_size <= 0 or self.previous_size <= 0:
+            return np.full((pair_count,), np.inf, dtype=np.float32)
 
-        counts_a = [len(a) for a, _ in pairs]
-        counts_b = [len(b) for _, b in pairs]
-        max_a = max(counts_a, default=0)
-        max_b = max(counts_b, default=0)
+        rows = candidate_indices[:, 0]
+        cols = candidate_indices[:, 1]
+        if np.any(rows < 0) or np.any(rows >= self.current_size):
+            raise IndexError("Current Chamfer candidate index is out of range")
+        if np.any(cols < 0) or np.any(cols >= self.previous_size):
+            raise IndexError("Previous Chamfer candidate index is out of range")
+
+        counts_a_np = self.current_counts_np[rows]
+        counts_b_np = self.previous_counts_np[cols]
+        max_a = int(counts_a_np.max(initial=0))
+        max_b = int(counts_b_np.max(initial=0))
         if max_a == 0 or max_b == 0:
-            return np.full((len(pairs),), np.inf, dtype=np.float32)
+            return np.full((pair_count,), np.inf, dtype=np.float32)
 
-        self._ensure(len(pairs), max_a, max_b)
-        assert self.host_a is not None and self.host_b is not None
-        assert self.host_count_a is not None and self.host_count_b is not None
-        assert self.gpu_a is not None and self.gpu_b is not None
-        assert self.gpu_count_a is not None and self.gpu_count_b is not None
+        assert self.host_pair_current is not None and self.host_pair_previous is not None
+        assert self.gpu_pair_current is not None and self.gpu_pair_previous is not None
+        assert self.gpu_current is not None and self.gpu_previous is not None
+        assert self.gpu_current_count is not None and self.gpu_previous_count is not None
+        assert self.pair_a is not None and self.pair_b is not None
+        assert self.pair_count_a is not None and self.pair_count_b is not None
 
-        pair_count = len(pairs)
-        host_a = self.host_a[:pair_count, :max_a]
-        host_b = self.host_b[:pair_count, :max_b]
-        host_a_np = host_a.numpy()
-        host_b_np = host_b.numpy()
-        for index, (a, b) in enumerate(pairs):
-            host_a_np[index, : len(a)] = np.asarray(a, dtype=np.float32)
-            host_b_np[index, : len(b)] = np.asarray(b, dtype=np.float32)
+        self.host_pair_current[:pair_count].numpy()[:] = rows
+        self.host_pair_previous[:pair_count].numpy()[:] = cols
+        gpu_rows = self.gpu_pair_current[:pair_count]
+        gpu_cols = self.gpu_pair_previous[:pair_count]
+        host_rows = self.host_pair_current[:pair_count]
+        host_cols = self.host_pair_previous[:pair_count]
+        gpu_rows.copy_(host_rows, non_blocking=host_rows.is_pinned())
+        gpu_cols.copy_(host_cols, non_blocking=host_cols.is_pinned())
 
-        host_count_a = self.host_count_a[:pair_count]
-        host_count_b = self.host_count_b[:pair_count]
-        host_count_a.numpy()[:] = counts_a
-        host_count_b.numpy()[:] = counts_b
-
-        gpu_a = self.gpu_a[:pair_count, :max_a]
-        gpu_b = self.gpu_b[:pair_count, :max_b]
-        gpu_count_a = self.gpu_count_a[:pair_count]
-        gpu_count_b = self.gpu_count_b[:pair_count]
-        gpu_a.copy_(host_a, non_blocking=host_a.is_pinned())
-        gpu_b.copy_(host_b, non_blocking=host_b.is_pinned())
-        gpu_count_a.copy_(host_count_a, non_blocking=host_count_a.is_pinned())
-        gpu_count_b.copy_(host_count_b, non_blocking=host_count_b.is_pinned())
+        # Gather the full preallocated point dimension so ``out`` remains a
+        # contiguous tensor. Padding is ignored by the count masks below.
+        torch.index_select(
+            self.gpu_current[: self.current_size],
+            0,
+            gpu_rows,
+            out=self.pair_a[:pair_count],
+        )
+        torch.index_select(
+            self.gpu_previous[: self.previous_size],
+            0,
+            gpu_cols,
+            out=self.pair_b[:pair_count],
+        )
+        pair_a = self.pair_a[:pair_count, :max_a]
+        pair_b = self.pair_b[:pair_count, :max_b]
+        torch.index_select(
+            self.gpu_current_count[: self.current_size],
+            0,
+            gpu_rows,
+            out=self.pair_count_a[:pair_count],
+        )
+        torch.index_select(
+            self.gpu_previous_count[: self.previous_size],
+            0,
+            gpu_cols,
+            out=self.pair_count_b[:pair_count],
+        )
 
         result = self._symmetric_gpu(
-            gpu_a,
-            gpu_b,
-            gpu_count_a,
-            gpu_count_b,
+            pair_a,
+            pair_b,
+            self.pair_count_a[:pair_count],
+            self.pair_count_b[:pair_count],
             max_a=max_a,
             max_b=max_b,
         )
         return result.detach().cpu().numpy()
 
     @staticmethod
-    def _compute_cpu(
+    def compute_cpu(
         pairs: list[tuple[np.ndarray, np.ndarray]],
         chunk: int = 256,
     ) -> np.ndarray:
@@ -865,7 +1040,7 @@ class _ChamferWorkspace:
 
 
 class CrossFrameAligner:
-    """Class+centroid hard gate -> batched Chamfer -> Hungarian."""
+    """Class+centroid hard gate -> persistent-bank GPU Chamfer -> Hungarian."""
 
     def __init__(self, config, *, num_views: int | None = None) -> None:
         cfg = config.get("cross_frame_alignment", {})
@@ -875,9 +1050,11 @@ class CrossFrameAligner:
         device = str(config.runtime.get("device", "cuda"))
         workspace_mb = float(cfg.get("chamfer_max_workspace_mb", 256.0))
         pair_capacity = max_cross_frame_candidate_pairs(config, num_views=num_views)
+        instance_capacity = max_cross_frame_instances(config, num_views=num_views)
         self.workspace = _ChamferWorkspace(
             device,
             max_pairs=pair_capacity,
+            max_instances=instance_capacity,
             max_workspace_mb=workspace_mb,
         )
         self.workspace.reserve_points(int(cfg.get("chamfer_preallocate_points", 0)))
@@ -887,6 +1064,37 @@ class CrossFrameAligner:
     def _assign_new_id(self, instance: MultiViewInstance) -> None:
         instance.global_track_id = self.next_global_track_id
         self.next_global_track_id += 1
+
+    def _stage_current_bank(
+        self,
+        current: list[MultiViewInstance],
+        profiler: Any | None,
+    ) -> None:
+        if not self.workspace.cuda_enabled:
+            return
+        context = (
+            profiler.stage("cross_frame_cloud_upload", cuda=True)
+            if profiler is not None
+            else _NullContext()
+        )
+        with context:
+            self.workspace.stage_current([item.points_world for item in current])
+
+        # Export zero-copy views of the bank that was already required for
+        # Chamfer. ScenePredictor reuses these views instead of uploading the
+        # same fused cloud a second time.
+        views, ready_event = self.workspace.current_cloud_views()
+        if len(views) != len(current):
+            raise RuntimeError(
+                "Cross-frame GPU bank view count does not match current fused "
+                f"instances: {len(views)} != {len(current)}"
+            )
+        # Assigning a Tensor slice is metadata-only: no D2D copy, no kernel, no
+        # cross-view GPU fusion. promote_current() only swaps workspace handles;
+        # these Tensor objects continue referencing the uploaded storage.
+        for item, view in zip(current, views):
+            item.points_world_gpu = view
+            item.points_world_gpu_ready_event = ready_event
 
     def align(
         self,
@@ -900,6 +1108,7 @@ class CrossFrameAligner:
         }
         if not current:
             self.previous = []
+            self.workspace.clear_previous()
             if profiler is not None:
                 profiler.record(
                     "cross_frame_total",
@@ -907,11 +1116,17 @@ class CrossFrameAligner:
                 )
             return counters
 
+        # Upload the unique current fused clouds once.  The previous frame was
+        # retained on CUDA by the prior promote_current() call.
+        self._stage_current_bank(current, profiler)
+
         if not self.previous:
             for instance in current:
                 self._assign_new_id(instance)
                 self._propagate_id_to_members(instance)
             self.previous = current
+            if self.workspace.cuda_enabled:
+                self.workspace.promote_current()
             if profiler is not None:
                 profiler.record(
                     "cross_frame_total",
@@ -925,7 +1140,9 @@ class CrossFrameAligner:
             else _NullContext()
         )
         with gate_context:
-            current_labels = np.asarray([item.semantic_label for item in current], dtype=object)
+            current_labels = np.asarray(
+                [item.semantic_label for item in current], dtype=object
+            )
             previous_labels = np.asarray(
                 [item.semantic_label for item in self.previous], dtype=object
             )
@@ -961,31 +1178,24 @@ class CrossFrameAligner:
         )
 
         if len(candidate_indices):
-            candidate_clouds = [
-                (
-                    current[int(row)].points_world,
-                    self.previous[int(col)].points_world,
-                )
-                for row, col in candidate_indices
-            ]
-            cuda_enabled = (
-                torch is not None
-                and torch.cuda.is_available()
-                and self.workspace.device is not None
-                and self.workspace.device.type == "cuda"
-            )
+            cuda_enabled = self.workspace.cuda_enabled
             chamfer_context = (
-                profiler.stage(
-                    "cross_frame_chamfer"
-                    if cuda_enabled
-                    else "cross_frame_chamfer",
-                    cuda=cuda_enabled,
-                )
+                profiler.stage("cross_frame_chamfer", cuda=cuda_enabled)
                 if profiler is not None
                 else _NullContext()
             )
             with chamfer_context:
-                chamfer = self.workspace.compute(candidate_clouds)
+                if cuda_enabled:
+                    chamfer = self.workspace.compute_indices(candidate_indices)
+                else:
+                    candidate_clouds = [
+                        (
+                            current[int(row)].points_world,
+                            self.previous[int(col)].points_world,
+                        )
+                        for row, col in candidate_indices
+                    ]
+                    chamfer = self.workspace.compute_cpu(candidate_clouds)
             for (row, col), distance in zip(candidate_indices, chamfer):
                 if not math.isfinite(float(distance)):
                     continue
@@ -1019,6 +1229,8 @@ class CrossFrameAligner:
             self._propagate_id_to_members(instance)
 
         self.previous = current
+        if self.workspace.cuda_enabled:
+            self.workspace.promote_current()
         if profiler is not None:
             profiler.record(
                 "cross_frame_total",

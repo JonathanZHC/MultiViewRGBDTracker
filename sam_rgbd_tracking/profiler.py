@@ -37,6 +37,10 @@ class FrameProfiler:
         "postprocess_masks",
         "postprocess_components",
         "postprocess_geometry",
+        "postprocess_geometry_prepare",
+        "postprocess_geometry_gpu",
+        "postprocess_geometry_d2h",
+        "postprocess_direct_fallback",
         "postprocess_finalize",
         "alignment_total",
         "cross_view_voxelize",
@@ -44,8 +48,11 @@ class FrameProfiler:
         "cross_view_voxel_match",
         "cross_view_hungarian",
         "cross_view_fusion",
+        "cross_view_gpu_fusion",
         "cross_view_total",
         "cross_frame_gate",
+        "cross_frame_cloud_upload",
+        "cross_frame_cloud_d2d",
         "cross_frame_chamfer",
         "cross_frame_hungarian",
         "cross_frame_total",
@@ -83,6 +90,13 @@ class FrameProfiler:
             self.csv_path = self.csv_path.with_name(
                 f"{self.csv_path.stem}_{safe}{self.csv_path.suffix}"
             )
+        # Buffer CSV rows and write them in batches. Per-frame open/write/close
+        # creates avoidable filesystem and scheduler traffic on the real-time path.
+        self.csv_flush_interval = max(
+            1, int(config.profiling.get("csv_flush_interval_frames", 100))
+        )
+        self._csv_buffer: list[tuple[int, dict[str, float]]] = []
+        self._csv_fields: list[str] | None = None
 
         self._history: dict[str, list[float]] = {}
         self._history_frames: dict[str, list[int]] = {}
@@ -146,11 +160,13 @@ class FrameProfiler:
 
         timings = dict(self._current_cpu)
         if self._current_cuda:
-            # One synchronization point per frame. Repeated stage names are
-            # accumulated, e.g. memory_attention can run more than once.
-            for pairs in self._current_cuda.values():
-                for _, end in pairs:
-                    end.synchronize()
+            # One current-stream synchronization point per frame. All stage end
+            # events have already been enqueued before this fence; once it has
+            # completed, elapsed_time() is valid for every recorded pair. This
+            # avoids one CUDA runtime synchronization call per profiled stage.
+            fence = torch.cuda.Event()
+            fence.record()
+            fence.synchronize()
             for name, pairs in self._current_cuda.items():
                 timings[name] = sum(
                     float(start.elapsed_time(end)) for start, end in pairs
@@ -160,6 +176,8 @@ class FrameProfiler:
             time.perf_counter() - self._frame_start
         )
 
+        flush_csv = False
+        print_now = False
         with self._lock:
             self._seen_frames += 1
             if self._seen_frames <= self.warmup_frames:
@@ -180,38 +198,71 @@ class FrameProfiler:
                 self._history_frames.setdefault(key, []).append(self._seen_frames)
             self.last_frame = timings
             if self.csv_path is not None:
-                self._append_csv(self._seen_frames, timings)
-            if (
+                self._csv_buffer.append((self._seen_frames, dict(timings)))
+                flush_csv = len(self._csv_buffer) >= self.csv_flush_interval
+            print_now = (
                 self.auto_print
                 and self.interval > 0
                 and self._frames % self.interval == 0
-            ):
-                self.print_summary()
+            )
+
+        # File I/O and summary formatting are deliberately outside the state lock.
+        if flush_csv:
+            self._flush_csv()
+        if print_now:
+            self.print_summary()
         return timings
 
-    def _append_csv(self, frame_number: int, timings: dict[str, float]) -> None:
+    def _flush_csv(self) -> None:
         path = self.csv_path
         if path is None:
             return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        exists = path.exists()
-        fields = ["frame", *self.PREFERRED_ORDER]
-        # Keep any future/new stages instead of silently dropping them.
-        fields.extend(sorted(k for k in timings if k not in fields))
+        with self._lock:
+            if not self._csv_buffer:
+                return
+            rows = self._csv_buffer
+            self._csv_buffer = []
+
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            exists = path.exists()
+            if self._csv_fields is None:
+                if exists and path.stat().st_size > 0:
+                    with path.open("r", newline="", encoding="utf-8") as handle:
+                        self._csv_fields = next(csv.reader(handle), None)
+                if not self._csv_fields:
+                    extras = sorted(
+                        {
+                            key
+                            for _, timings in rows
+                            for key in timings
+                            if key not in self.PREFERRED_ORDER
+                        }
+                    )
+                    self._csv_fields = ["frame", *self.PREFERRED_ORDER, *extras]
+
             with path.open("a", newline="", encoding="utf-8") as handle:
                 writer = csv.DictWriter(
                     handle,
-                    fieldnames=fields,
+                    fieldnames=self._csv_fields,
                     extrasaction="ignore",
                 )
-                if not exists:
+                if not exists or path.stat().st_size == 0:
                     writer.writeheader()
-                writer.writerow({"frame": frame_number, **timings})
-        except (OSError, ValueError):
+                writer.writerows(
+                    {"frame": frame_number, **timings}
+                    for frame_number, timings in rows
+                )
+        except (OSError, ValueError, StopIteration):
             # A mounted log folder can be read-only, and an existing CSV may
-            # have an older header. Profiling must never stop the real-time path.
+            # have an incompatible header. Profiling must never stop real-time.
             self.csv_path = None
+            with self._lock:
+                self._csv_buffer.clear()
+
+    def close(self) -> None:
+        """Flush any buffered profiler rows without changing timing statistics."""
+        self._flush_csv()
 
     @staticmethod
     def _summary(values: list[float]) -> tuple[float, float, float, float, int]:

@@ -281,6 +281,39 @@ class StreamingVideoState:
         # Update the logical tag only after the image copy has been enqueued.
         self._slot_logical_indices[slot] = int(logical_index)
 
+    def _commit_preprocessed_frame(
+        self,
+        image_chw: Any,
+        logical_index: int,
+    ) -> None:
+        """Store one already-normalized model image in the bounded ring.
+
+        This is used by the multi-view batch preprocessor so synchronized camera
+        views share one H2D + resize/normalize pass instead of repeating the same
+        preprocessing pipeline independently per view.
+        """
+        if torch is None or not torch.is_tensor(image_chw):
+            raise TypeError("Preprocessed EfficientTAM image must be a torch.Tensor")
+        expected = (3, self.image_size, self.image_size)
+        if tuple(image_chw.shape) != expected:
+            raise ValueError(
+                f"Expected preprocessed image shape {expected}, got {tuple(image_chw.shape)}"
+            )
+        logical_index = int(logical_index)
+        slot = logical_index % self._capacity
+        self._frame_buffer[slot].copy_(
+            image_chw.to(self.storage_device, dtype=torch.float32, non_blocking=True),
+            non_blocking=True,
+        )
+        self._slot_logical_indices[slot] = logical_index
+
+    def append_preprocessed(self, image_chw: Any) -> int:
+        next_index = int(self.state["num_frames"])
+        self._commit_preprocessed_frame(image_chw, next_index)
+        self.state["num_frames"] = next_index + 1
+        self.frame_index = next_index
+        return next_index
+
     def reset(self, rgb: np.ndarray) -> None:
         """Reuse the inference-state object and restart logical frame numbering."""
         self._validate_rgb(rgb)
@@ -309,3 +342,132 @@ class StreamingVideoState:
 
     def close(self) -> None:
         self.temp_dir.cleanup()
+
+
+class BatchedStreamingPreprocessor:
+    """Reusable synchronized RGB preprocessor for multiple live streams.
+
+    The hot path performs one pinned-host staging copy per view, one batched H2D,
+    and one batched cast/resize/normalize operation.  The normalized images are
+    then copied into each stream's fixed logical-frame ring.
+    """
+
+    def __init__(self, streams: list[StreamingVideoState]) -> None:
+        if torch is None or F is None:
+            raise RuntimeError("PyTorch is required for batched preprocessing")
+        if not streams:
+            raise ValueError("At least one stream is required")
+        if any(not stream._gpu_preprocess for stream in streams):
+            raise ValueError("Batched preprocessing requires GPU preprocessing on every stream")
+
+        first = streams[0]
+        self.num_views = len(streams)
+        self.height = int(first.height)
+        self.width = int(first.width)
+        self.image_size = int(first.image_size)
+        self.device = torch.device(first.compute_device)
+        self.pin_input_memory = bool(first._pin_input_memory)
+
+        for stream in streams[1:]:
+            if (stream.height, stream.width) != (self.height, self.width):
+                raise ValueError("All batched EfficientTAM streams must share one RGB resolution")
+            if int(stream.image_size) != self.image_size:
+                raise ValueError("All batched EfficientTAM streams must share one model image size")
+            if torch.device(stream.compute_device) != self.device:
+                raise ValueError("All batched EfficientTAM streams must share one CUDA device")
+            if torch.device(stream.storage_device) != self.device:
+                raise ValueError("Batched preprocessing requires CUDA-backed stream storage")
+
+        try:
+            self.host_u8 = torch.empty(
+                (self.num_views, self.height, self.width, 3),
+                dtype=torch.uint8,
+                device="cpu",
+                pin_memory=self.pin_input_memory,
+            )
+        except RuntimeError:
+            self.host_u8 = torch.empty(
+                (self.num_views, self.height, self.width, 3),
+                dtype=torch.uint8,
+                device="cpu",
+            )
+        self.host_np = self.host_u8.numpy()
+        self.device_u8 = torch.empty(
+            (self.num_views, self.height, self.width, 3),
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        # Reuse this cast/permute target every frame; F.interpolate still owns
+        # its output tensor, but the full-resolution float input is allocation-free.
+        self.device_nchw = torch.empty(
+            (self.num_views, 3, self.height, self.width),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.mean = torch.tensor(
+            [0.485, 0.456, 0.406], dtype=torch.float32, device=self.device
+        ).view(1, 3, 1, 1)
+        self.std = torch.tensor(
+            [0.229, 0.224, 0.225], dtype=torch.float32, device=self.device
+        ).view(1, 3, 1, 1)
+
+    def compatible(self, streams: list[StreamingVideoState]) -> bool:
+        if len(streams) != self.num_views:
+            return False
+        for stream in streams:
+            if not stream._gpu_preprocess:
+                return False
+            if (stream.height, stream.width) != (self.height, self.width):
+                return False
+            if int(stream.image_size) != self.image_size:
+                return False
+            if torch.device(stream.compute_device) != self.device:
+                return False
+            if torch.device(stream.storage_device) != self.device:
+                return False
+        return True
+
+    def append(
+        self,
+        streams: list[StreamingVideoState],
+        rgbs: list[np.ndarray],
+    ) -> int:
+        if len(streams) != self.num_views or len(rgbs) != self.num_views:
+            raise ValueError(
+                f"Expected {self.num_views} synchronized streams/RGBs, "
+                f"got streams={len(streams)} rgbs={len(rgbs)}"
+            )
+        logical_indices = [int(stream.state["num_frames"]) for stream in streams]
+        if len(set(logical_indices)) != 1:
+            raise RuntimeError(
+                "Multi-view streams became misaligned before batched preprocessing: "
+                f"frame_indices={logical_indices}"
+            )
+
+        for view_index, (stream, rgb) in enumerate(zip(streams, rgbs)):
+            rgb = stream._validate_rgb(rgb)
+            np.copyto(self.host_np[view_index], rgb, casting="no")
+
+        self.device_u8.copy_(
+            self.host_u8, non_blocking=bool(self.host_u8.is_pinned())
+        )
+        self.device_nchw.copy_(self.device_u8.permute(0, 3, 1, 2))
+        self.device_nchw.mul_(1.0 / 255.0)
+        normalized = F.interpolate(
+            self.device_nchw,
+            size=(self.image_size, self.image_size),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        )
+        normalized.sub_(self.mean).div_(self.std)
+
+        next_index = logical_indices[0]
+        for view_index, stream in enumerate(streams):
+            committed = stream.append_preprocessed(normalized[view_index])
+            if committed != next_index:
+                raise RuntimeError(
+                    "Batched EfficientTAM append returned inconsistent frame index: "
+                    f"expected={next_index}, got={committed}"
+                )
+        return next_index

@@ -217,6 +217,7 @@ class MultiViewEfficientTAMComponent:
         if sam3_filter_ms is not None:
             self.profiler.record("sam3_filter", float(sam3_filter_ms))
 
+        self.postprocessor.prefetch_depth_async(frames)
         with self.profiler.stage("sam3_slot_assoc", cuda=False):
             seeds_per_view = [
                 view.initialize_tracks(frame, detections)
@@ -330,6 +331,7 @@ class MultiViewEfficientTAMComponent:
 
         self.profiler.begin_frame()
         frames = self.make_frames_batch(view_inputs)
+        self.postprocessor.prefetch_depth_async(frames)
         current_frame_idx = int(frames[0].frame_index)
         correction_applied = False
         correction_drop_reason: str | None = None
@@ -428,6 +430,7 @@ class MultiViewEfficientTAMComponent:
         self.profiler.print_summary()
 
     def close(self) -> None:
+        self.profiler.close()
         self.postprocessor.close()
         self.tracker.close()
         for view in self.views:

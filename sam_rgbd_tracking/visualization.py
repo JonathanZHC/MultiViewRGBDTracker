@@ -48,6 +48,31 @@ def _instance_label(instance: Any) -> str:
         suffix += f" M{group_id}"
     return f"{instance.label} [slot {instance.tracker_slot}]{suffix}"
 
+
+def instance_mask_cpu(instance: Any, shape: tuple[int, int]) -> np.ndarray:
+    """Return the final instance mask as a CPU bool array on demand.
+
+    Lazy postprocess keeps the canonical final mask on CUDA and leaves the
+    compatibility NumPy field empty on normal frames. Visualization/output calls
+    this helper only after a subscriber check, so the D2H transfer stays outside
+    the numerical tracking critical path.
+    """
+    mask = getattr(instance, "mask", None)
+    if mask is not None:
+        value = np.asarray(mask, dtype=bool)
+        if value.shape == shape:
+            return value
+
+    mask_gpu = getattr(instance, "mask_gpu", None)
+    if mask_gpu is not None:
+        value = mask_gpu.detach().cpu().numpy()
+        value = np.asarray(value, dtype=bool)
+        if value.shape == shape:
+            return value
+
+    return np.zeros(shape, dtype=bool)
+
+
 def make_overlay(result: FrameResult) -> np.ndarray:
     """Compatibility helper for callers outside ``RvizPublisher``.
 
@@ -56,9 +81,9 @@ def make_overlay(result: FrameResult) -> np.ndarray:
     image = result.frame.rgb.copy()
     for instance in result.instances:
         color = _color(_instance_color_key(instance))
-        mask = instance.mask
         if instance.bbox_2d_xyxy is None:
             continue
+        mask = instance_mask_cpu(instance, result.frame.depth_m.shape)
         blended = (
             image[mask].astype(np.float32) * 0.55
             + color.astype(np.float32) * 0.45
@@ -97,9 +122,13 @@ def make_mask_debug(result: FrameResult, *, raw: bool) -> np.ndarray:
     if instance_map is None:
         instance_map = np.zeros((h, w), dtype=np.uint8)
         for code, instance in enumerate(result.instances, start=1):
-            instance_map[instance.raw_mask if raw else instance.mask] = np.uint8(
-                min(code, 255)
-            )
+            if raw:
+                mask = np.asarray(instance.raw_mask, dtype=bool)
+                if mask.shape != (h, w):
+                    continue
+            else:
+                mask = instance_mask_cpu(instance, (h, w))
+            instance_map[mask] = np.uint8(min(code, 255))
     else:
         instance_map = np.asarray(instance_map, dtype=np.uint8)
 

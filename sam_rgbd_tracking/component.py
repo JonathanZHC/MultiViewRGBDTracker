@@ -532,4 +532,4 @@ class SAMTrackingComponent:
         self.profiler.print_summary()
 
     def close(self) -> None:
-        return None
+        self.profiler.close()
