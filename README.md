@@ -527,7 +527,8 @@ pointcloud:
 
 postprocess:
   mask_threshold: 0.0
-  erosion_pixels: 2
+  tracking_erosion_pixels: 2
+  exclusion_dilation_pixels: 3
   min_component_pixels: 30
   min_valid_depth_m: 0.10
   max_valid_depth_m: 6.0

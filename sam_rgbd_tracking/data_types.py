@@ -149,6 +149,10 @@ class MultiViewInstance:
 class FrameResult:
     frame: RGBDFrame
     instances: list[ProcessedInstance]
+    # Union of all exclusion-only semantic slots for this camera. Production
+    # batched execution keeps this as a CUDA bool tensor; CPU/debug fallback may
+    # provide a NumPy bool array. Excluded slots never appear in ``instances``.
+    exclusion_mask_gpu: Any | None
     owner_track_map: np.ndarray | None
     keyframe: bool
     timings_ms: dict[str, float]

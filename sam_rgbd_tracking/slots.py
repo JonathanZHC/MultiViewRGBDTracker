@@ -95,6 +95,28 @@ def class_capacities(config) -> dict[str, int]:
     return dict(prompt_capacities(config))
 
 
+def excluded_labels(config) -> frozenset[str]:
+    return frozenset(
+        str(value).strip()
+        for value in config.detector.get("excluded_labels", [])
+        if str(value).strip()
+    )
+
+
+def tracked_prompt_capacities(config) -> list[tuple[str, int]]:
+    """Return only prompt capacities that enter 3-D alignment.
+
+    Excluded classes still reserve EfficientTAM slots, but they stop after 2-D
+    morphology and therefore must not inflate cross-frame Chamfer workspaces.
+    """
+    excluded = excluded_labels(config)
+    return [
+        (label, capacity)
+        for label, capacity in prompt_capacities(config)
+        if label not in excluded
+    ]
+
+
 def max_cross_frame_instances(config, *, num_views: int | None = None) -> int:
     """Strict upper bound on temporal observations after cross-view grouping.
 
@@ -107,7 +129,7 @@ def max_cross_frame_instances(config, *, num_views: int | None = None) -> int:
     num_views = int(num_views)
     if num_views <= 0:
         raise ValueError("Cross-frame alignment requires at least one camera view")
-    return num_views * sum(capacity for _, capacity in prompt_capacities(config))
+    return num_views * sum(capacity for _, capacity in tracked_prompt_capacities(config))
 
 
 def max_cross_frame_candidate_pairs(config, *, num_views: int | None = None) -> int:
@@ -135,7 +157,7 @@ def max_cross_frame_candidate_pairs(config, *, num_views: int | None = None) -> 
         raise ValueError("Cross-frame alignment requires at least one camera view")
     return sum(
         (num_views * capacity) * (num_views * capacity)
-        for _, capacity in prompt_capacities(config)
+        for _, capacity in tracked_prompt_capacities(config)
     )
 
 

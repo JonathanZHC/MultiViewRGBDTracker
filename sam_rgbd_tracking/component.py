@@ -19,6 +19,7 @@ from .data_types import (
     VisibilityState,
 )
 from .processing import (
+    _erosion_kernel,
     backproject_mask,
     bbox_3d,
     erode_filter_and_bbox,
@@ -29,7 +30,7 @@ from .processing import (
     mask_iou,
 )
 from .profiler import FrameProfiler
-from .slots import build_slot_layout
+from .slots import build_slot_layout, excluded_labels
 
 
 class SAMTrackingComponent:
@@ -51,6 +52,7 @@ class SAMTrackingComponent:
         self.camera_name = camera_name
         self.profiler = FrameProfiler(config, name=f"{camera_name}/efficient_tam")
         self.slot_layout = build_slot_layout(config)
+        self.excluded_labels = excluded_labels(config)
         self.tracks: dict[int, TrackState] = {}
         self.next_track_id = len(self.slot_layout) + 1
         self.release_after_missing_frames = max(
@@ -127,7 +129,7 @@ class SAMTrackingComponent:
                 )
                 centroid = (
                     robust_centroid(frame.depth_m, mask, frame.intrinsics)
-                    if active
+                    if active and spec.semantic_label not in self.excluded_labels
                     else None
                 )
                 confidence = float(detection.score) if detection is not None else 0.0
@@ -187,7 +189,20 @@ class SAMTrackingComponent:
                 for track_id in expected
                 if track_id in self.tracks and self.tracks[track_id].label == label
             ]
-            active_tracks = [track for track in class_tracks if track.active]
+            # Exclusion-only slots intentionally avoid per-frame CPU bbox/CC
+            # lifecycle work. Only for those classes, an active slot with an
+            # empty refresh fallback is reusable capacity. Tracked classes keep
+            # the original slot-association semantics unchanged.
+            exclusion_only = label in self.excluded_labels
+            active_tracks = [
+                track
+                for track in class_tracks
+                if track.active
+                and (
+                    not exclusion_only
+                    or np.any(masks_by_id[track.track_id])
+                )
+            ]
 
             candidate_edges: list[tuple[float, int, int]] = []
             for det_index, detection in enumerate(class_detections):
@@ -210,7 +225,18 @@ class SAMTrackingComponent:
                 matched_tracks.add(track_id)
 
             free_tracks = sorted(
-                (track for track in class_tracks if not track.active),
+                (
+                    track
+                    for track in class_tracks
+                    if track.track_id not in matched_tracks
+                    and (
+                        not track.active
+                        or (
+                            exclusion_only
+                            and not np.any(masks_by_id[track.track_id])
+                        )
+                    )
+                ),
                 key=lambda track: track.class_slot,
             )
             for det_index, detection in enumerate(class_detections):
@@ -218,12 +244,14 @@ class SAMTrackingComponent:
                     continue
                 track = free_tracks.pop(0)
                 masks_by_id[track.track_id] = np.asarray(detection.mask, dtype=bool).copy()
+                was_active = bool(track.active)
                 track.active = True
                 track.semantic_confidence = float(detection.score)
                 track.tracking_confidence = float(detection.score)
                 track.missing_frames = 0
                 track.last_seen_frame = reference_frame.frame_index
-                activated += 1
+                if not was_active:
+                    activated += 1
 
         return [masks_by_id[track_id] for track_id in expected], activated
 
@@ -246,6 +274,7 @@ class SAMTrackingComponent:
                 owner,
                 raw_instance_map,
                 filtered_instance_map,
+                exclusion_mask,
             ) = self._postprocess(frame, prediction)
         timings = self.profiler.end_frame()
         metadata = {
@@ -262,6 +291,7 @@ class SAMTrackingComponent:
         return FrameResult(
             frame=frame,
             instances=instances,
+            exclusion_mask_gpu=exclusion_mask,
             owner_track_map=owner,
             keyframe=bool(keyframe),
             timings_ms=timings,
@@ -271,9 +301,11 @@ class SAMTrackingComponent:
         )
 
     def raw_masks_by_track(self, result: FrameResult) -> dict[int, np.ndarray]:
+        del result
         return {
-            int(instance.track_id): np.asarray(instance.raw_mask, dtype=bool).copy()
-            for instance in result.instances
+            int(track_id): np.asarray(track.last_raw_mask, dtype=bool).copy()
+            for track_id, track in self.tracks.items()
+            if track.active and track.last_raw_mask is not None
         }
 
     def _ensure_logits(
@@ -332,13 +364,9 @@ class SAMTrackingComponent:
         np.ndarray,
         np.ndarray | None,
         np.ndarray | None,
+        np.ndarray | None,
     ]:
-        """Convert tracker masks to geometry without depth-based mask exclusion.
-
-        Visualization-only raster products are prepared here once, while masks
-        are already hot in cache.  This avoids rescanning every instance mask in
-        the RViz stage.  They are omitted entirely when visualization is disabled.
-        """
+        """CPU/debug postprocess with tracked/excluded semantic separation."""
         h, w = frame.depth_m.shape
         logits = self._ensure_logits(prediction, h, w)
 
@@ -351,10 +379,7 @@ class SAMTrackingComponent:
                 and index < logits.shape[0]
             )
         ]
-        track_ids = [
-            int(prediction.track_ids[index])
-            for index in valid_channels
-        ]
+        track_ids = [int(prediction.track_ids[index]) for index in valid_channels]
         logits = (
             logits[valid_channels]
             if valid_channels
@@ -367,62 +392,74 @@ class SAMTrackingComponent:
         debug_images_enabled = visualization_enabled and bool(
             self.config.runtime.get("publish_debug_images", True)
         )
-
+        owner_track_map = np.zeros((h, w), dtype=np.int32)
+        raw_instance_map = (
+            np.zeros((h, w), dtype=np.uint8) if debug_images_enabled else None
+        )
+        filtered_instance_map = (
+            np.zeros((h, w), dtype=np.uint8) if debug_images_enabled else None
+        )
+        exclusion_mask = (
+            np.zeros((h, w), dtype=bool) if self.excluded_labels else None
+        )
         if not track_ids:
-            empty_owner = np.zeros((h, w), dtype=np.int32)
-            filtered_map = (
-                np.zeros((h, w), dtype=np.uint8)
-                if debug_images_enabled
-                else None
+            return (
+                [], owner_track_map, raw_instance_map, filtered_instance_map, exclusion_mask
             )
-            raw_map = (
-                np.zeros((h, w), dtype=np.uint8)
-                if debug_images_enabled
-                else None
-            )
-            return [], empty_owner, raw_map, filtered_map
 
         threshold = float(self.config.postprocess.mask_threshold)
-
-        # Threshold all fixed object channels in one NumPy operation rather than
-        # allocating one temporary threshold result per Python loop iteration.
         raw_mask_stack = logits > threshold
-        final_masks: list[np.ndarray] = []
-        bboxes_2d: list[tuple[int, int, int, int] | None] = []
-        for channel in range(len(track_ids)):
-            filtered, bbox_2d = erode_filter_and_bbox(
-                raw_mask_stack[channel],
-                int(self.config.postprocess.erosion_pixels),
-                int(self.config.postprocess.min_component_pixels),
+        tracking_erosion_pixels = int(
+            self.config.postprocess.tracking_erosion_pixels
+        )
+        exclusion_dilation_pixels = int(
+            self.config.postprocess.get("exclusion_dilation_pixels", 0)
+        )
+        min_component_pixels = int(self.config.postprocess.min_component_pixels)
+
+        tracked_masks: list[np.ndarray] = []
+        tracked_ids: list[int] = []
+        tracked_entries: list[tuple[int, int, np.ndarray, np.ndarray, tuple[int, int, int, int] | None]] = []
+
+        for channel, track_id in enumerate(track_ids):
+            track = self.tracks[track_id]
+            raw_mask = raw_mask_stack[channel]
+            if track.label in self.excluded_labels:
+                if exclusion_dilation_pixels > 0 and np.any(raw_mask):
+                    final = cv2.dilate(
+                        raw_mask.astype(np.uint8, copy=False),
+                        _erosion_kernel(exclusion_dilation_pixels),
+                        iterations=1,
+                    ).astype(bool, copy=False)
+                else:
+                    final = np.asarray(raw_mask, dtype=bool)
+                if exclusion_mask is not None:
+                    np.logical_or(exclusion_mask, final, out=exclusion_mask)
+                track.last_raw_mask = np.asarray(raw_mask, dtype=bool)
+                track.last_mask = track.last_raw_mask
+                if channel < prediction.presence_scores.size:
+                    track.tracking_confidence = float(prediction.presence_scores[channel])
+                if np.any(raw_mask):
+                    track.last_seen_frame = frame.frame_index
+                    track.missing_frames = 0
+                else:
+                    track.missing_frames += 1
+                    if track.missing_frames >= self.release_after_missing_frames:
+                        track.active = False
+                continue
+
+            final_mask, bbox_2d = erode_filter_and_bbox(
+                raw_mask, tracking_erosion_pixels, min_component_pixels
             )
-            final_masks.append(filtered)
-            bboxes_2d.append(bbox_2d)
+            tracked_masks.append(final_mask)
+            tracked_ids.append(track_id)
+            tracked_entries.append((channel, track_id, raw_mask, final_mask, bbox_2d))
 
-        # Overlap pixels stay 0 for external ownership/occlusion handling.
-        owner_track_map = nonoverlap_owner_map(
-            final_masks,
-            track_ids,
-            h,
-            w,
-        )
+        if tracked_masks:
+            owner_track_map = nonoverlap_owner_map(
+                tracked_masks, tracked_ids, h, w
+            )
 
-        # Build compact visualization maps once in postprocess.  Values are
-        # uint8 per-frame instance codes (1..N), not global track IDs.  The true
-        # ownership map above remains int32/track-ID based.  Using one byte/pixel
-        # cuts debug-raster memory traffic by 4x and feeds OpenCV applyColorMap
-        # directly without conversion.
-        filtered_instance_map = (
-            np.zeros((h, w), dtype=np.uint8)
-            if debug_images_enabled
-            else None
-        )
-        raw_instance_map = (
-            np.zeros((h, w), dtype=np.uint8)
-            if debug_images_enabled
-            else None
-        )
-
-        # Depth validity affects only 3-D point generation.
         valid_geometry_depth = valid_depth_mask(
             frame.depth_m,
             float(self.config.postprocess.min_valid_depth_m),
@@ -430,13 +467,11 @@ class SAMTrackingComponent:
         )
 
         processed: list[ProcessedInstance] = []
-        for channel, track_id in enumerate(track_ids):
+        for visual_index, (channel, track_id, raw_mask, final_mask, bbox_2d) in enumerate(
+            tracked_entries, start=1
+        ):
             track = self.tracks[track_id]
-            raw_mask = raw_mask_stack[channel]
-            final_mask = final_masks[channel]
-            bbox_2d = bboxes_2d[channel]
-
-            visual_code = np.uint8(min(channel + 1, 255))
+            visual_code = np.uint8(min(visual_index, 255))
             if filtered_instance_map is not None:
                 filtered_instance_map[final_mask] = visual_code
             if raw_instance_map is not None:
@@ -451,36 +486,26 @@ class SAMTrackingComponent:
                 int(self.config.pointcloud.stride),
                 int(self.config.pointcloud.max_points_per_instance),
             )
-            points_world = transform_points(
-                points_camera,
-                frame.world_from_camera,
-            )
-
+            points_world = transform_points(points_camera, frame.world_from_camera)
             centroid_camera = (
-                None
-                if points_camera.size == 0
+                None if points_camera.size == 0
                 else np.median(points_camera, axis=0).astype(np.float32)
             )
             centroid_world = (
-                None
-                if points_world is None or points_world.size == 0
+                None if points_world is None or points_world.size == 0
                 else np.median(points_world, axis=0).astype(np.float32)
             )
             bounds_min, bounds_max = bbox_3d(
                 points_world if points_world is not None else points_camera
             )
 
-            track.last_raw_mask = raw_mask
-            track.last_mask = final_mask
+            track.last_raw_mask = np.asarray(raw_mask, dtype=bool)
+            track.last_mask = np.asarray(final_mask, dtype=bool)
             track.centroid_camera = centroid_camera
             track.centroid_world = centroid_world
             if channel < prediction.presence_scores.size:
-                track.tracking_confidence = float(
-                    prediction.presence_scores[channel]
-                )
+                track.tracking_confidence = float(prediction.presence_scores[channel])
 
-            # bbox_2d is already derived from the final filtered mask, so it also
-            # tells us whether the mask is empty without another full-image scan.
             if bbox_2d is not None:
                 track.last_seen_frame = frame.frame_index
                 track.missing_frames = 0
@@ -492,7 +517,6 @@ class SAMTrackingComponent:
                     track.active = False
 
             motion_conf = min(max(float(track.tracking_confidence), 0.0), 1.0)
-
             processed.append(
                 ProcessedInstance(
                     track_id=track_id,
@@ -500,8 +524,8 @@ class SAMTrackingComponent:
                     semantic_confidence=track.semantic_confidence,
                     tracking_confidence=track.tracking_confidence,
                     motion_prediction_confidence=motion_conf,
-                    raw_mask=raw_mask,
-                    mask=final_mask,
+                    raw_mask=np.asarray(raw_mask, dtype=bool),
+                    mask=np.asarray(final_mask, dtype=bool),
                     points_camera=points_camera,
                     points_world=points_world,
                     colors_rgb=colors,
@@ -521,6 +545,7 @@ class SAMTrackingComponent:
             owner_track_map,
             raw_instance_map,
             filtered_instance_map,
+            exclusion_mask,
         )
 
     def _new_track_id(self) -> int:

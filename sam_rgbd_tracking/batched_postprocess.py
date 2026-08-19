@@ -31,6 +31,7 @@ class _MaskRecord:
     view_index: int
     channel: int
     track_id: int
+    excluded: bool = False
     raw_mask: np.ndarray | None = None
     final_mask: np.ndarray | None = None
     final_mask_gpu: Any | None = None
@@ -80,6 +81,12 @@ class BatchedPostprocessor:
         self.config = config
         self.num_views = int(num_views)
         self.voxelizer = voxelizer
+        self.excluded_labels = frozenset(
+            str(value).strip()
+            for value in config.detector.get("excluded_labels", [])
+            if str(value).strip()
+        )
+        self.has_excluded_labels = bool(self.excluded_labels)
         workers = int(
             config.postprocess.get(
                 "cpu_workers", config.runtime.get("postprocess_workers", 0)
@@ -347,17 +354,26 @@ class BatchedPostprocessor:
                 ):
                     continue
                 index = len(records)
-                records.append(_MaskRecord(view_index, channel, track_id))
+                records.append(
+                    _MaskRecord(
+                        view_index,
+                        channel,
+                        track_id,
+                        excluded=(track.label in self.excluded_labels),
+                    )
+                )
                 resize_groups.setdefault(key, []).append(index)
         return records, resize_groups, logits_per_view
 
     @staticmethod
-    def _resize_threshold_erode_cpu(
+    def _resize_threshold_morph_cpu(
         logits: np.ndarray,
         width: int,
         height: int,
         threshold: float,
-        erosion_pixels: int,
+        morphology_pixels: int,
+        *,
+        dilate: bool,
     ) -> tuple[np.ndarray, np.ndarray]:
         if logits.shape != (height, width):
             resized = cv2.resize(
@@ -368,15 +384,36 @@ class BatchedPostprocessor:
         else:
             resized = np.asarray(logits, dtype=np.float32)
         raw = resized > threshold
-        if erosion_pixels > 0 and np.any(raw):
-            eroded = cv2.erode(
+        pixels = max(0, int(morphology_pixels))
+        if pixels > 0 and np.any(raw):
+            operation = cv2.dilate if dilate else cv2.erode
+            final = operation(
                 raw.astype(np.uint8, copy=False),
-                _erosion_kernel(erosion_pixels),
+                _erosion_kernel(pixels),
                 iterations=1,
             )
         else:
-            eroded = raw.astype(np.uint8, copy=False)
-        return raw, eroded
+            final = raw.astype(np.uint8, copy=False)
+        return raw, final
+
+    @staticmethod
+    def _union_cpu_exclusion_masks(
+        records: list[_MaskRecord],
+        shapes: list[tuple[int, int]],
+    ) -> list[np.ndarray | None]:
+        output: list[np.ndarray | None] = [None] * len(shapes)
+        for record in records:
+            if not record.excluded or record.final_mask is None:
+                continue
+            value = np.asarray(record.final_mask, dtype=bool)
+            if value.shape != shapes[record.view_index]:
+                continue
+            current = output[record.view_index]
+            if current is None:
+                output[record.view_index] = value.copy()
+            else:
+                np.logical_or(current, value, out=current)
+        return output
 
     def _batch_masks_gpu(
         self,
@@ -386,11 +423,20 @@ class BatchedPostprocessor:
         *,
         need_raw_masks: bool,
         need_final_masks: bool,
-    ) -> list[tuple[_MaskRecord, np.ndarray | None]]:
+    ) -> tuple[
+        list[tuple[_MaskRecord, np.ndarray | None]],
+        list[torch.Tensor | None],
+    ]:
         assert torch is not None and F is not None and self.device is not None
         threshold = float(self.config.postprocess.mask_threshold)
-        erosion_pixels = int(self.config.postprocess.erosion_pixels)
-        pending: list[tuple[_MaskRecord, np.ndarray]] = []
+        tracking_erosion_pixels = int(
+            self.config.postprocess.tracking_erosion_pixels
+        )
+        exclusion_dilation_pixels = int(
+            self.config.postprocess.get("exclusion_dilation_pixels", 0)
+        )
+        pending: list[tuple[_MaskRecord, np.ndarray | None]] = []
+        exclusion_masks: list[torch.Tensor | None] = [None] * self.num_views
 
         for (_, _, dst_h, dst_w), indices in resize_groups.items():
             tensors = []
@@ -425,50 +471,105 @@ class BatchedPostprocessor:
                     align_corners=False,
                 )
             raw = batch[:, 0] > threshold
-            if erosion_pixels > 0:
-                k = 2 * erosion_pixels + 1
+
+            # Preserve the original one-morphology fast path when ScenePredictor
+            # has no excluded prompts. With exclusions enabled, compute only the
+            # two batched morphology variants and select by static slot metadata.
+            if tracking_erosion_pixels > 0:
+                k = 2 * tracking_erosion_pixels + 1
                 background = (~raw).to(torch.float32).unsqueeze(1)
-                eroded = (
+                tracked_final = (
                     F.max_pool2d(
                         background,
                         kernel_size=k,
                         stride=1,
-                        padding=erosion_pixels,
+                        padding=tracking_erosion_pixels,
                     )[:, 0]
                     < 0.5
                 )
             else:
-                eroded = raw
+                tracked_final = raw
 
-            # Normal tracking needs only the cleaned/eroded mask on CPU.  Raw
-            # full-resolution masks are transferred only when they are actually
-            # consumed: debug-image publication or the exact frame submitted to
-            # asynchronous SAM3 as its fallback reference.
-            eroded_u8_gpu = eroded.to(torch.uint8)
+            if self.has_excluded_labels:
+                excluded_flags_cpu = [records[index].excluded for index in indices]
+                if any(excluded_flags_cpu):
+                    if exclusion_dilation_pixels > 0:
+                        k = 2 * exclusion_dilation_pixels + 1
+                        excluded_final = (
+                            F.max_pool2d(
+                                raw.to(torch.float32).unsqueeze(1),
+                                kernel_size=k,
+                                stride=1,
+                                padding=exclusion_dilation_pixels,
+                            )[:, 0]
+                            > 0.5
+                        )
+                    else:
+                        excluded_final = raw
+                    flags = torch.as_tensor(
+                        excluded_flags_cpu, dtype=torch.bool, device=self.device
+                    ).view(-1, 1, 1)
+                    final = torch.where(flags, excluded_final, tracked_final)
+                else:
+                    final = tracked_final
+            else:
+                final = tracked_final
+
+            final_u8_gpu = final.to(torch.uint8)
             if need_raw_masks:
-                packed = torch.cat((raw.to(torch.uint8), eroded_u8_gpu), dim=0).cpu().numpy()
+                packed = torch.cat(
+                    (raw.to(torch.uint8), final_u8_gpu), dim=0
+                ).cpu().numpy()
                 count = len(indices)
                 raw_cpu = packed[:count]
-                eroded_cpu = packed[count:]
+                final_cpu = packed[count:]
             elif need_final_masks:
                 raw_cpu = None
-                eroded_cpu = eroded_u8_gpu.cpu().numpy()
+                # Excluded masks do not need CPU materialization for geometry or
+                # alignment. A single packed transfer is retained for tracked masks.
+                tracked_local = [
+                    local for local, idx in enumerate(indices)
+                    if not records[idx].excluded
+                ]
+                final_cpu = None
+                tracked_cpu: dict[int, np.ndarray] = {}
+                if tracked_local:
+                    values = final_u8_gpu[tracked_local].cpu().numpy()
+                    tracked_cpu = {
+                        local: values[pos]
+                        for pos, local in enumerate(tracked_local)
+                    }
             else:
                 raw_cpu = None
-                eroded_cpu = None
+                final_cpu = None
+                tracked_cpu = {}
+
             for local_index, record_index in enumerate(indices):
                 record = records[record_index]
-                # Keep a zero-copy view of the eroded mask on CUDA for the direct
-                # mask/depth -> geometry fast path. The parent tensor stays alive
-                # through this view for the duration of process().
-                record.final_mask_gpu = eroded_u8_gpu[local_index]
+                record.final_mask_gpu = final_u8_gpu[local_index]
                 if raw_cpu is not None:
                     record.raw_mask = raw_cpu[local_index].view(np.bool_)
-                pending.append((
-                    record,
-                    None if eroded_cpu is None else eroded_cpu[local_index],
-                ))
-        return pending
+                if record.excluded:
+                    mask = final[local_index]
+                    current = exclusion_masks[record.view_index]
+                    if current is None:
+                        exclusion_masks[record.view_index] = mask.clone()
+                    else:
+                        current.logical_or_(mask)
+                    # Excluded slots stop here: no CC metadata and no geometry.
+                    if need_raw_masks:
+                        record.final_mask = final_cpu[local_index].view(np.bool_)
+                    continue
+
+                if need_raw_masks:
+                    cpu_mask = final_cpu[local_index]
+                elif need_final_masks:
+                    cpu_mask = tracked_cpu.get(local_index)
+                else:
+                    cpu_mask = None
+                pending.append((record, cpu_mask))
+
+        return pending, exclusion_masks
 
     def _batch_masks_cpu(
         self,
@@ -478,19 +579,29 @@ class BatchedPostprocessor:
         *,
         need_raw_masks: bool,
         need_final_masks: bool,
-    ) -> list[tuple[_MaskRecord, np.ndarray | None]]:
-        """CPU fallback: submit all independent masks as one persistent task batch."""
+    ) -> tuple[
+        list[tuple[_MaskRecord, np.ndarray | None]],
+        list[np.ndarray | None],
+    ]:
+        """CPU fallback with the same tracked/excluded semantic split."""
         threshold = float(self.config.postprocess.mask_threshold)
-        erosion_pixels = int(self.config.postprocess.erosion_pixels)
+        tracking_erosion_pixels = int(
+            self.config.postprocess.tracking_erosion_pixels
+        )
+        exclusion_dilation_pixels = int(
+            self.config.postprocess.get("exclusion_dilation_pixels", 0)
+        )
         jobs = []
+        shapes: list[tuple[int, int]] = [(0, 0)] * self.num_views
         for (_, _, dst_h, dst_w), indices in resize_groups.items():
             for record_index in indices:
                 record = records[record_index]
+                shapes[record.view_index] = (dst_h, dst_w)
                 jobs.append(
                     (
                         record,
                         self._pool.submit(
-                            self._resize_threshold_erode_cpu,
+                            self._resize_threshold_morph_cpu,
                             (
                                 logits_per_view[record.view_index][record.channel]
                                 .detach().float().cpu().numpy()
@@ -503,17 +614,27 @@ class BatchedPostprocessor:
                             dst_w,
                             dst_h,
                             threshold,
-                            erosion_pixels,
+                            (
+                                exclusion_dilation_pixels
+                                if record.excluded
+                                else tracking_erosion_pixels
+                            ),
+                            dilate=record.excluded,
                         ),
                     )
                 )
-        pending: list[tuple[_MaskRecord, np.ndarray]] = []
+
+        pending: list[tuple[_MaskRecord, np.ndarray | None]] = []
         for record, future in jobs:
-            raw, eroded = future.result()
+            raw, final = future.result()
             if need_raw_masks:
                 record.raw_mask = raw
-            pending.append((record, eroded))
-        return pending
+            if record.excluded:
+                record.final_mask = final.view(np.bool_)
+                continue
+            pending.append((record, final if need_final_masks else None))
+
+        return pending, self._union_cpu_exclusion_masks(records, shapes)
 
     def _batch_masks(
         self,
@@ -523,7 +644,7 @@ class BatchedPostprocessor:
         *,
         need_raw_masks: bool,
         need_final_masks: bool,
-    ) -> list[tuple[_MaskRecord, np.ndarray | None]]:
+    ):
         if self.mask_stage_cuda:
             return self._batch_masks_gpu(
                 records, resize_groups, logits_per_view,
@@ -1081,6 +1202,8 @@ class BatchedPostprocessor:
         visualization_enabled: bool,
         profiler: Any,
     ) -> list[_GeometryRecord]:
+        if not records:
+            return []
         if self.gpu_geometry_enabled:
             return self._batch_geometry_gpu(
                 records,
@@ -1151,13 +1274,14 @@ class BatchedPostprocessor:
                 records, resize_groups, logits_per_view = self._collect_records(
                     views, frames, predictions
                 )
-                pending_components = self._batch_masks(
+                pending_components, exclusion_masks = self._batch_masks(
                     records,
                     resize_groups,
                     logits_per_view,
                     need_raw_masks=need_raw_masks,
                     need_final_masks=need_final_masks,
                 )
+                tracked_records = [record for record in records if not record.excluded]
 
             with profiler.stage(
                 "postprocess_components", cuda=bool(lazy_common_frame and self.mask_stage_cuda)
@@ -1166,7 +1290,7 @@ class BatchedPostprocessor:
 
             with profiler.stage("postprocess_geometry", cuda=False):
                 geometry = self._batch_geometry(
-                    records,
+                    tracked_records,
                     frames,
                     need_colors=visualization_enabled,
                     visualization_enabled=visualization_enabled,
@@ -1180,7 +1304,7 @@ class BatchedPostprocessor:
                 filtered_maps: list[np.ndarray | None] = [None] * len(views)
 
                 records_per_view: list[list[int]] = [[] for _ in views]
-                for record_index, record in enumerate(records):
+                for record_index, record in enumerate(tracked_records):
                     records_per_view[record.view_index].append(record_index)
 
                 # Build owner/debug rasters only inside object ROIs.  The old
@@ -1207,7 +1331,7 @@ class BatchedPostprocessor:
                     for code, record_index in enumerate(
                         records_per_view[view_index], start=1
                     ):
-                        record = records[record_index]
+                        record = tracked_records[record_index]
                         bbox = record.bbox_2d
                         if bbox is not None and record.final_mask is not None:
                             x0, y0, x1, y1 = bbox
@@ -1241,7 +1365,25 @@ class BatchedPostprocessor:
                     raw_maps[view_index] = raw_map
                     filtered_maps[view_index] = filtered_map
 
-                for record_index, record in enumerate(records):
+                # Excluded slots intentionally stop before geometry/alignment. Raw
+                # masks are retained only on refresh/debug frames for SAM3 fallback
+                # continuity; normal frames keep the union mask entirely on CUDA.
+                for record in records:
+                    if not record.excluded:
+                        continue
+                    view = views[record.view_index]
+                    prediction = predictions[record.view_index]
+                    track = view.tracks[record.track_id]
+                    if record.raw_mask is not None:
+                        raw_mask = np.asarray(record.raw_mask, dtype=bool)
+                        track.last_raw_mask = raw_mask
+                        track.last_mask = raw_mask
+                    if record.channel < prediction.presence_scores.size:
+                        track.tracking_confidence = float(
+                            prediction.presence_scores[record.channel]
+                        )
+
+                for record_index, record in enumerate(tracked_records):
                     view = views[record.view_index]
                     frame = frames[record.view_index]
                     prediction = predictions[record.view_index]
@@ -1331,6 +1473,7 @@ class BatchedPostprocessor:
                 FrameResult(
                     frame=frame,
                     instances=instances_per_view[view_index],
+                    exclusion_mask_gpu=exclusion_masks[view_index],
                     owner_track_map=owner_per_view[view_index],
                     keyframe=bool(keyframe),
                     timings_ms={},
