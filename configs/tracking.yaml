@@ -95,6 +95,13 @@ postprocess:
   mask_threshold: 0.0
   tracking_erosion_pixels: 2
   exclusion_dilation_pixels: 3
+  # CUDA depth-boundary flyer filter for tracked masks (A/B switch); see
+  # sam_rgbd_tracking/depth_boundary_filter.py. Runs after the residual fixed erosion.
+  depth_boundary_filter:
+    enabled: false
+    erosion_width_px: 5
+    mad_multiplier: 5.0
+    min_threshold_m: 0.0
   min_component_pixels: 30
   min_valid_depth_m: 0.10
   max_valid_depth_m: 6.0

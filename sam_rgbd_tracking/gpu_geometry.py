@@ -1145,6 +1145,18 @@ class GPUSparseGeometryBackend:
         torch.cuda.current_stream(device=self.device).wait_event(self._depth_ready_event)
         return True
 
+    def depth_for_frames(self, frames: list[Any]) -> torch.Tensor:
+        """Return the ``[V, H, W]`` float32 CUDA depth for ``frames``, uploading if needed.
+
+        Reuses the asynchronous prefetch when it targeted these frames; otherwise packs and
+        uploads now. The caller's current stream is made to wait for the copy, and the
+        prefetch key is kept so the later geometry stage does not upload depth again.
+        """
+        if self._prefetched_depth_key != self._depth_frame_key(frames):
+            self.prefetch_depth(frames)
+        torch.cuda.current_stream(device=self.device).wait_event(self._depth_ready_event)
+        return self._direct_depths[: len(frames)]
+
     def prepare_direct_masks(
         self,
         records: list[Any],

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -24,6 +25,8 @@ from .data_types import (
 )
 from .processing import _erosion_kernel
 from .gpu_geometry import GeometrySamples, GPUSparseGeometryBackend
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -135,6 +138,34 @@ class BatchedPostprocessor:
         )
         self._depth_prefetch_future = None
         self._depth_prefetch_key = None
+        # Frames whose async depth prefetch was already awaited by the mask stage
+        # (depth boundary filter) so geometry can still reuse the uploaded depth.
+        self._depth_prefetch_done_key = None
+        self._depth_boundary_filter = self._build_depth_boundary_filter(config)
+
+    def _build_depth_boundary_filter(self, config):
+        """Optional CUDA depth-boundary flyer filter for tracked masks (A/B switch)."""
+        settings = config.postprocess.get("depth_boundary_filter", None)
+        if settings is None or not bool(settings.get("enabled", False)):
+            return None
+        if not (self.mask_stage_cuda and self.gpu_geometry_enabled):
+            _LOGGER.warning(
+                "postprocess.depth_boundary_filter.enabled requires the CUDA mask stage "
+                "and gpu_geometry; filter disabled."
+            )
+            return None
+        from .depth_boundary_filter import DepthBoundaryFilter
+
+        try:
+            return DepthBoundaryFilter(
+                self.device,
+                erosion_width_px=int(settings.get("erosion_width_px", 5)),
+                mad_multiplier=float(settings.get("mad_multiplier", 5.0)),
+                min_threshold_m=float(settings.get("min_threshold_m", 0.0)),
+            )
+        except Exception as exc:  # pragma: no cover - depends on local CUDA toolchain
+            _LOGGER.warning("depth boundary filter unavailable (%s); filter disabled.", exc)
+            return None
 
     def submit(self, function, /, *args):
         """Submit one small CPU job to the persistent postprocess pool."""
@@ -162,13 +193,24 @@ class BatchedPostprocessor:
         )
 
     def _finish_depth_prefetch(self, frames: list[RGBDFrame]) -> bool:
+        key = self._frame_key(frames)
         if self._depth_prefetch_future is None:
-            return False
-        if self._depth_prefetch_key != self._frame_key(frames):
+            return self._depth_prefetch_done_key == key
+        if self._depth_prefetch_key != key:
             return False
         self._depth_prefetch_future.result()
         self._depth_prefetch_future = None
+        self._depth_prefetch_done_key = key
         return True
+
+    def _depth_gpu_for_mask_filter(self, frames: list[RGBDFrame]) -> torch.Tensor:
+        """``[V, H, W]`` CUDA depth for the mask stage; joins the async prefetch if any."""
+        assert self._gpu_geometry is not None
+        self._finish_depth_prefetch(frames)
+        depth = self._gpu_geometry.depth_for_frames(frames)
+        # Depth is now resident for these frames; let geometry skip its own upload.
+        self._depth_prefetch_done_key = self._frame_key(frames)
+        return depth
 
     def depth_prefetch_profile_ms(self) -> dict[str, float] | None:
         if self._gpu_geometry is None:
@@ -423,11 +465,14 @@ class BatchedPostprocessor:
         *,
         need_raw_masks: bool,
         need_final_masks: bool,
+        frames: list[RGBDFrame] | None = None,
     ) -> tuple[
         list[tuple[_MaskRecord, np.ndarray | None]],
         list[torch.Tensor | None],
     ]:
         assert torch is not None and F is not None and self.device is not None
+        boundary_filter = self._depth_boundary_filter if frames else None
+        depth_gpu = None
         threshold = float(self.config.postprocess.mask_threshold)
         tracking_erosion_pixels = int(
             self.config.postprocess.tracking_erosion_pixels
@@ -489,6 +534,37 @@ class BatchedPostprocessor:
                 )
             else:
                 tracked_final = raw
+
+            # Depth-boundary flyer filter (B path). Runs after the residual fixed
+            # erosion and grows back only depth-consistent pixels of the eroded mask,
+            # so ``tracking_erosion_pixels`` keeps its meaning. Tracked slots only;
+            # excluded slots keep the dilation path below.
+            if boundary_filter is not None:
+                if depth_gpu is None:
+                    depth_gpu = self._depth_gpu_for_mask_filter(frames)
+                if tuple(depth_gpu.shape[-2:]) == (dst_h, dst_w):
+                    tracked_local = [
+                        local for local, idx in enumerate(indices)
+                        if not records[idx].excluded
+                    ]
+                    if tracked_local:
+                        all_tracked = len(tracked_local) == len(indices)
+                        source = tracked_final if all_tracked else tracked_final[tracked_local]
+                        filtered = boundary_filter(
+                            source.to(torch.uint8).contiguous(),
+                            [records[indices[local]].view_index for local in tracked_local],
+                            depth_gpu,
+                        )
+                        if all_tracked:
+                            tracked_final = filtered.bool()
+                        else:
+                            tracked_final = tracked_final.clone()
+                            tracked_final[tracked_local] = filtered.bool()
+                else:
+                    _LOGGER.warning(
+                        "depth boundary filter skipped: mask %dx%d != depth %dx%d",
+                        dst_w, dst_h, int(depth_gpu.shape[-1]), int(depth_gpu.shape[-2]),
+                    )
 
             if self.has_excluded_labels:
                 excluded_flags_cpu = [records[index].excluded for index in indices]
@@ -644,11 +720,13 @@ class BatchedPostprocessor:
         *,
         need_raw_masks: bool,
         need_final_masks: bool,
+        frames: list[RGBDFrame] | None = None,
     ):
         if self.mask_stage_cuda:
             return self._batch_masks_gpu(
                 records, resize_groups, logits_per_view,
-                need_raw_masks=need_raw_masks, need_final_masks=need_final_masks
+                need_raw_masks=need_raw_masks, need_final_masks=need_final_masks,
+                frames=frames,
             )
         return self._batch_masks_cpu(
             records, resize_groups, logits_per_view,
@@ -1280,6 +1358,7 @@ class BatchedPostprocessor:
                     logits_per_view,
                     need_raw_masks=need_raw_masks,
                     need_final_masks=need_final_masks,
+                    frames=frames,
                 )
                 tracked_records = [record for record in records if not record.excluded]
 
