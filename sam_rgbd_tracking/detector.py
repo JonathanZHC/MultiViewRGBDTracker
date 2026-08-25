@@ -31,6 +31,15 @@ class InstanceDetector(Protocol):
         ...
 
 
+# Run one SAM3 grounding pass over all (view, prompt) pairs instead of one pass
+# per prompt. SAM3 pairs image and text features per row (FindStage.img_ids /
+# text_ids), so the math is identical up to bf16 batch-shape rounding, which was
+# measured at the same magnitude as the old code's own B=1 vs B=2 variation
+# (~0.2 logit). Measured 160 -> 121 ms for 2 views x 3 prompts. Set False for the
+# legacy per-prompt loop (text embeddings are cached in both modes).
+GROUND_ALL_PROMPTS_IN_ONE_PASS = True
+
+
 class Sam3Detector:
     """Text-prompted SAM3 detector with true multi-image image batching.
 
@@ -165,6 +174,25 @@ class Sam3Detector:
             item.detection_id = detection_id
         return filtered, counts
 
+    def _text_features(self, prompts: list[str]) -> dict[str, Any]:
+        """SAM3 text-encoder outputs for ``prompts``, computed once per process.
+
+        The language backbone sees only the caption strings, so its output is a
+        constant for a fixed prompt list. Tensors are cloned per call so a
+        grounding forward can never mutate the cached copy. Must be called under
+        the same autocast context as the grounding forward (dtype consistency).
+        """
+        key = tuple(prompts)
+        cached = getattr(self, "_text_feature_cache", None)
+        if cached is None or cached[0] != key:
+            outputs = self.model.backbone.forward_text(list(prompts), device=self.device)
+            cached = (key, outputs)
+            self._text_feature_cache = cached
+        return {
+            name: (value.clone() if torch.is_tensor(value) else value)
+            for name, value in cached[1].items()
+        }
+
     @torch.inference_mode()
     def detect_rgb_batch(
         self,
@@ -196,53 +224,98 @@ class Sam3Detector:
         ):
             state = self.processor.set_image_batch(images)
             device = torch.device(self.device)
-            find_stage = FindStage(
-                img_ids=torch.arange(batch_size, device=device, dtype=torch.long),
-                text_ids=torch.zeros(batch_size, device=device, dtype=torch.long),
-                input_boxes=None,
-                input_boxes_mask=None,
-                input_boxes_label=None,
-                input_points=None,
-                input_points_mask=None,
-            )
 
-            for prompt in self.prompts:
-                text_outputs = self.model.backbone.forward_text(
-                    [prompt],
-                    device=self.device,
+            # One grounding pass over all (view, prompt) pairs. SAM3 pairs image
+            # features and text features per row via FindStage.img_ids/text_ids
+            # (``language_features[:, text_ids]``, ``_get_img_feats(img_ids)``), so
+            # this is the same math as one call per prompt, with the fusion
+            # encoder/decoder launched once instead of len(prompts) times. Text
+            # embeddings depend only on the constant prompt strings and are
+            # encoded once per process instead of once per refresh.
+            prompts = list(self.prompts)
+            prompt_count = len(prompts)
+            pair_count = batch_size * prompt_count
+
+            def _ground(text_prompts: list[str], text_ids: torch.Tensor):
+                state["backbone_out"].update(self._text_features(text_prompts))
+                rows = int(text_ids.shape[0])
+                stage = FindStage(
+                    img_ids=torch.arange(batch_size, device=device, dtype=torch.long)
+                    .repeat_interleave(rows // batch_size),
+                    text_ids=text_ids,
+                    input_boxes=None,
+                    input_boxes_mask=None,
+                    input_boxes_label=None,
+                    input_points=None,
+                    input_points_mask=None,
                 )
-                state["backbone_out"].update(text_outputs)
-                geometric_prompt = self.model._get_dummy_prompt(
-                    num_prompts=batch_size
-                )
-                output = self.model.forward_grounding(
+                return self.model.forward_grounding(
                     backbone_out=state["backbone_out"],
-                    find_input=find_stage,
-                    geometric_prompt=geometric_prompt,
+                    find_input=stage,
+                    geometric_prompt=self.model._get_dummy_prompt(num_prompts=rows),
                     find_target=None,
                 )
 
-                logits = output["pred_logits"]
-                if logits.ndim == 2:
-                    logits = logits.unsqueeze(-1)
-                probabilities = logits.sigmoid().squeeze(-1)
+            if GROUND_ALL_PROMPTS_IN_ONE_PASS:
+                # Row order: (view 0, prompt 0), (view 0, prompt 1), ..., (view 1, prompt 0), ...
+                output = _ground(
+                    prompts,
+                    torch.arange(prompt_count, device=device, dtype=torch.long).repeat(batch_size),
+                )
+                logits_all = output["pred_logits"]
+                boxes_all = output["pred_boxes"]
+                masks_all = output["pred_masks"]
+                presence_all = output.get("presence_logit_dec")
+            else:
+                # Legacy per-prompt grounding (text still cached); rows regrouped
+                # into the same (view, prompt) order as above.
+                per_prompt = [
+                    _ground([prompt], torch.zeros(batch_size, device=device, dtype=torch.long))
+                    for prompt in prompts
+                ]
 
-                presence = output.get("presence_logit_dec")
-                if presence is not None:
-                    presence = presence.sigmoid().reshape(batch_size, -1)[:, :1]
-                    probabilities = probabilities * presence
+                def _interleave(key):
+                    values = [item[key] for item in per_prompt]
+                    if any(v is None for v in values):
+                        return None
+                    stacked = torch.stack(values, dim=1)          # [B, P, ...]
+                    return stacked.reshape(pair_count, *stacked.shape[2:])
 
-                boxes_xyxy = box_ops.box_cxcywh_to_xyxy(output["pred_boxes"])
-                masks_logits = output["pred_masks"]
+                logits_all = _interleave("pred_logits")
+                boxes_all = _interleave("pred_boxes")
+                masks_all = _interleave("pred_masks")
+                presence_all = _interleave("presence_logit_dec") if all(
+                    item.get("presence_logit_dec") is not None for item in per_prompt
+                ) else None
 
-                for view_idx, rgb in enumerate(rgbs):
-                    keep = probabilities[view_idx] > self.effective_score_threshold
-                    if not bool(keep.any()):
-                        continue
+            logits = logits_all
+            if logits.ndim == 2:
+                logits = logits.unsqueeze(-1)
+            probabilities = logits.sigmoid().squeeze(-1)
 
-                    scores = probabilities[view_idx][keep]
-                    boxes = boxes_xyxy[view_idx][keep]
-                    masks = masks_logits[view_idx][keep]
+            if presence_all is not None:
+                presence = presence_all.sigmoid().reshape(pair_count, -1)[:, :1]
+                probabilities = probabilities * presence
+
+            boxes_xyxy = box_ops.box_cxcywh_to_xyxy(boxes_all)
+            masks_logits = masks_all
+            # One D2H for all pair/query scores; decide what to keep on the host
+            # instead of one ``bool(keep.any())`` stream sync per pair.
+            keep_all = probabilities > self.effective_score_threshold
+            keep_all_cpu = keep_all.cpu().numpy()
+
+            for pair_index in range(pair_count):
+                view_idx = pair_index // prompt_count
+                prompt = prompts[pair_index % prompt_count]
+                rgb = rgbs[view_idx]
+                if not keep_all_cpu[pair_index].any():
+                    continue
+                keep = keep_all[pair_index]
+
+                if True:
+                    scores = probabilities[pair_index][keep]
+                    boxes = boxes_xyxy[pair_index][keep]
+                    masks = masks_logits[pair_index][keep]
                     height, width = rgb.shape[:2]
                     masks = F.interpolate(
                         masks.unsqueeze(1),

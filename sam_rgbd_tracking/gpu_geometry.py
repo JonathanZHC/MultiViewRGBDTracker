@@ -537,6 +537,8 @@ class GPUGeometryRecord:
     bbox_2d: tuple[int, int, int, int] | None = None
     foreground_pixels: int = 0
     geometry_stride: int = 1
+    # Mean of the unique voxel representatives (world), from the compact path.
+    centroid_world: np.ndarray | None = None
 
 
 @dataclass(slots=True)
@@ -557,6 +559,8 @@ class _PendingBatch:
     direct_bbox_gpu: Any | None = None
     direct_foreground_gpu: Any | None = None
     direct_strides_gpu: Any | None = None
+    # [R, 3] mean of each record's unique voxel representatives (device).
+    record_centroids_gpu: Any | None = None
 
 
 class GPUSparseGeometryBackend:
@@ -937,6 +941,11 @@ class GPUSparseGeometryBackend:
         self._host_compact_lengths = torch.empty(capacity, dtype=torch.int32, pin_memory=True)
         self._host_compact_counts = torch.empty(capacity, dtype=torch.int32, pin_memory=True)
         self._host_compact_bbox = torch.empty((capacity, 4), dtype=torch.int32, pin_memory=True)
+        # Per-record mean of the unique voxel representatives, computed on device
+        # in the geometry stage so GPU-alignment mode gets centroids from the
+        # existing phase-1 metadata copy (no extra kernels or syncs in fusion).
+        self._record_centroids = torch.zeros((capacity, 3), dtype=torch.float32, device=self.device)
+        self._host_compact_centroids = torch.empty((capacity, 3), dtype=torch.float32, pin_memory=True)
         self._host_compact_foreground = torch.empty(capacity, dtype=torch.int32, pin_memory=True)
         self._host_compact_strides = torch.empty(capacity, dtype=torch.int32, pin_memory=True)
         self._record_capacity = capacity
@@ -1051,15 +1060,30 @@ class GPUSparseGeometryBackend:
         max_points: int,
     ) -> None:
         self._ensure_depth_buffers(view_count, height, width)
-        shape = (int(record_count), int(view_count), int(height), int(width))
-        if self._direct_shape == shape and self._direct_max_points == int(max_points):
-            return
-
-        r = max(1, int(record_count))
-        v = max(1, int(view_count))
+        # Capacity semantics (grow-only), like every sibling ``_ensure_*``. The
+        # record count changes whenever a track activates or is released; an
+        # exact-shape test here reallocated 13 CUDA + 3 pinned tensors (cudaHostAlloc
+        # synchronizes the device) and rebuilt all Warp wrappers each time.
+        if self._direct_shape is not None:
+            cap_r, cap_v, cap_h, cap_w = self._direct_shape
+            if (
+                int(record_count) <= cap_r
+                and int(view_count) <= cap_v
+                and int(height) == cap_h
+                and int(width) == cap_w
+                and int(max_points) <= self._direct_max_points
+            ):
+                return
+            r = max(1, int(record_count), cap_r)
+            v = max(1, int(view_count), cap_v)
+            m = max(1, int(max_points), self._direct_max_points)
+        else:
+            r = max(1, int(record_count))
+            v = max(1, int(view_count))
+            m = max(1, int(max_points))
         h = int(height)
         w = int(width)
-        m = max(1, int(max_points))
+        shape = (r, v, h, w)
         fixed = r * m
 
         self._direct_masks = torch.empty((r, h, w), dtype=torch.uint8, device=self.device)
@@ -1553,6 +1577,25 @@ class GPUSparseGeometryBackend:
             self._last_gpu_profile_pairs = direct_pairs
             self._last_gpu_profile_events = None
             self._last_gpu_profile_names = None
+
+        # Per-record centroid (mean of unique representatives), fully on device:
+        # slot i belongs to record r when offsets[r] <= i < offsets[r] + unique_counts[r].
+        slots = torch.arange(fixed_total, device=self.device, dtype=torch.int32)
+        record_of_slot = torch.searchsorted(
+            self._device_offsets[1 : record_count + 1], slots, right=True
+        ).clamp_(max=record_count - 1)
+        segment_begin = self._device_offsets[:record_count].index_select(0, record_of_slot)
+        segment_count = self._unique_counts[:record_count].index_select(0, record_of_slot)
+        in_unique = (slots - segment_begin) < segment_count
+        # Slots outside the unique segments hold stale/uninitialized values
+        # (possibly NaN/Inf): select, never multiply by a 0/1 mask.
+        weighted = torch.where(
+            in_unique.unsqueeze(1), self._unique_points[:fixed_total], 0.0
+        )
+        centroids = self._record_centroids[:record_count]
+        centroids.zero_()
+        centroids.index_add_(0, record_of_slot.to(torch.long), weighted)
+        centroids.div_(self._unique_counts[:record_count].clamp(min=1).unsqueeze(1).to(torch.float32))
         if direct_cpu is not None:
             now = perf_counter()
             direct_cpu["post_submit"] = (now - direct_cpu_t0) * 1000.0
@@ -1573,6 +1616,7 @@ class GPUSparseGeometryBackend:
             direct_bbox_gpu=(self._direct_bbox[:record_count] if masks_prepared else None),
             direct_foreground_gpu=(self._direct_foreground[:record_count] if masks_prepared else None),
             direct_strides_gpu=(self._direct_strides[:record_count] if masks_prepared else None),
+            record_centroids_gpu=centroids,
         )
 
     def compute(
@@ -1849,6 +1893,9 @@ class GPUSparseGeometryBackend:
         pending: _PendingBatch,
         records: list[Any],
         frames: list[Any],
+        *,
+        copy_points: bool = True,
+        copy_voxels: bool = True,
     ) -> list[GPUGeometryRecord]:
         """Materialize the exact CPU-alignment voxel packet.
 
@@ -1860,6 +1907,11 @@ class GPUSparseGeometryBackend:
         To preserve CPU-alignment semantics exactly, this compact path copies
         those exact representative slices to pinned host memory. Raw per-pixel
         camera/world clouds remain GPU-only.
+
+        ``copy_points`` / ``copy_voxels`` select which host copies are made.
+        GPU-alignment mode needs no point copy at all (fusion and Chamfer stay
+        on device) and needs keys/coords only when cross-view matching can
+        happen (>= 2 cameras); with both False the second stream sync is skipped.
         """
         record_count = len(records)
         if record_count == 0:
@@ -1886,7 +1938,15 @@ class GPUSparseGeometryBackend:
             self._host_compact_strides[:record_count].copy_(
                 pending.direct_strides_gpu[:record_count], non_blocking=True
             )
+        if pending.record_centroids_gpu is not None:
+            self._host_compact_centroids[:record_count].copy_(
+                pending.record_centroids_gpu[:record_count], non_blocking=True
+            )
         current.synchronize()
+        centroids_cpu = (
+            self._host_compact_centroids[:record_count].numpy()
+            if pending.record_centroids_gpu is not None else None
+        )
 
         lengths_np = self._host_compact_lengths[:record_count].numpy()
         counts_np = self._host_compact_counts[:record_count].numpy()
@@ -1897,7 +1957,10 @@ class GPUSparseGeometryBackend:
         unique_total = int(unique_offsets[-1])
 
         # Phase 2: exact unique slices, preserving key->representative mapping.
-        if unique_total > 0:
+        keys_cpu = np.empty((0,), dtype=np.int64)
+        coords_cpu = np.empty((0, 3), dtype=np.int32)
+        points_cpu = np.empty((0, 3), dtype=np.float32)
+        if unique_total > 0 and (copy_points or copy_voxels):
             for record_index in range(record_count):
                 count = counts[record_index]
                 if count <= 0:
@@ -1907,24 +1970,24 @@ class GPUSparseGeometryBackend:
                 dst_begin = unique_offsets[record_index]
                 dst_end = dst_begin + count
 
-                self._host_compact_keys[dst_begin:dst_end].copy_(
-                    pending.unique_keys[src_begin:src_end], non_blocking=True
-                )
-                self._host_compact_coords[dst_begin:dst_end].copy_(
-                    pending.unique_coords[src_begin:src_end], non_blocking=True
-                )
-                self._host_compact_points[dst_begin:dst_end].copy_(
-                    pending.unique_points[src_begin:src_end], non_blocking=True
-                )
+                if copy_voxels:
+                    self._host_compact_keys[dst_begin:dst_end].copy_(
+                        pending.unique_keys[src_begin:src_end], non_blocking=True
+                    )
+                    self._host_compact_coords[dst_begin:dst_end].copy_(
+                        pending.unique_coords[src_begin:src_end], non_blocking=True
+                    )
+                if copy_points:
+                    self._host_compact_points[dst_begin:dst_end].copy_(
+                        pending.unique_points[src_begin:src_end], non_blocking=True
+                    )
 
             current.synchronize()
-            keys_cpu = self._host_compact_keys[:unique_total].numpy()
-            coords_cpu = self._host_compact_coords[:unique_total].numpy()
-            points_cpu = self._host_compact_points[:unique_total].numpy()
-        else:
-            keys_cpu = np.empty((0,), dtype=np.int64)
-            coords_cpu = np.empty((0, 3), dtype=np.int32)
-            points_cpu = np.empty((0, 3), dtype=np.float32)
+            if copy_voxels:
+                keys_cpu = self._host_compact_keys[:unique_total].numpy()
+                coords_cpu = self._host_compact_coords[:unique_total].numpy()
+            if copy_points:
+                points_cpu = self._host_compact_points[:unique_total].numpy()
 
         bbox_cpu = (
             self._host_compact_bbox[:record_count].numpy()
@@ -1950,18 +2013,25 @@ class GPUSparseGeometryBackend:
             rend = raw_offsets[record_index + 1]
             frame = frames[int(record.view_index)]
 
-            unique_coords = np.array(
-                coords_cpu[ubegin:uend], dtype=np.int64, copy=True, order="C"
-            )
-            unique_keys = np.array(
-                keys_cpu[ubegin:uend], dtype=np.int64, copy=True, order="C"
-            )
-            unique_points = np.array(
-                points_cpu[ubegin:uend], dtype=np.float32, copy=True, order="C"
-            )
-
             has_world = frame.world_from_camera is not None
-            if has_world and unique_coords.size:
+            if copy_voxels:
+                unique_coords = np.array(
+                    coords_cpu[ubegin:uend], dtype=np.int64, copy=True, order="C"
+                )
+                unique_keys = np.array(
+                    keys_cpu[ubegin:uend], dtype=np.int64, copy=True, order="C"
+                )
+            else:
+                unique_coords = np.empty((0, 3), dtype=np.int64)
+                unique_keys = np.empty((0,), dtype=np.int64)
+            if copy_points:
+                unique_points = np.array(
+                    points_cpu[ubegin:uend], dtype=np.float32, copy=True, order="C"
+                )
+            else:
+                unique_points = np.empty((0, 3), dtype=np.float32)
+
+            if has_world and copy_voxels and unique_coords.size:
                 shifted = unique_coords + int(self._BIAS)
                 if np.any(shifted < 0) or np.any(shifted > int(self._MASK)):
                     raise ValueError(
@@ -1984,7 +2054,9 @@ class GPUSparseGeometryBackend:
                 fg = int(foreground_cpu[record_index])
                 stride = int(strides_cpu[record_index])
 
-            cpu_world = unique_points if has_world else None
+            # Without a host point copy the NumPy cloud is None; consumers use
+            # the CUDA views / point counts instead (GPU-alignment mode).
+            cpu_world = unique_points if (has_world and copy_points) else None
             output.append(
                 GPUGeometryRecord(
                     points_camera=empty_points,
@@ -1992,17 +2064,17 @@ class GPUSparseGeometryBackend:
                     colors_rgb=empty_colors,
                     voxel_coords=(
                         unique_coords
-                        if has_world and len(unique_coords)
+                        if has_world and copy_voxels and len(unique_coords)
                         else None
                     ),
                     voxel_keys=(
                         unique_keys
-                        if has_world and len(unique_keys)
+                        if has_world and copy_voxels and len(unique_keys)
                         else None
                     ),
                     voxel_points=(
                         unique_points
-                        if has_world and len(unique_points)
+                        if has_world and copy_points and len(unique_points)
                         else None
                     ),
                     voxel_colors=None,
@@ -2034,6 +2106,11 @@ class GPUSparseGeometryBackend:
                     bbox_2d=bbox_2d,
                     foreground_pixels=fg,
                     geometry_stride=stride,
+                    centroid_world=(
+                        np.array(centroids_cpu[record_index], dtype=np.float32, copy=True)
+                        if (centroids_cpu is not None and has_world and counts[record_index] > 0)
+                        else None
+                    ),
                 )
             )
         return output

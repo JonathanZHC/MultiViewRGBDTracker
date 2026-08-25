@@ -24,6 +24,7 @@ from .data_types import (
     VisibilityState,
 )
 from .processing import _erosion_kernel
+from .alignment import gpu_alignment_enabled
 from .gpu_geometry import GeometrySamples, GPUSparseGeometryBackend
 
 _LOGGER = logging.getLogger(__name__)
@@ -136,6 +137,13 @@ class BatchedPostprocessor:
             if self.gpu_geometry_enabled
             else None
         )
+        # GPU-alignment mode: cross-view fusion and Chamfer staging consume the
+        # CUDA voxel representatives directly, so the compact D2H only needs the
+        # per-record counts (single camera) or keys/coords for CPU matching
+        # (>= 2 cameras). Never the point cloud itself.
+        self.gpu_alignment = bool(self.gpu_geometry_enabled and gpu_alignment_enabled(config))
+        self._compact_copy_points = not self.gpu_alignment
+        self._compact_copy_voxels = (not self.gpu_alignment) or self.num_views >= 2
         self._depth_prefetch_future = None
         self._depth_prefetch_key = None
         # Frames whose async depth prefetch was already awaited by the mask stage
@@ -1010,7 +1018,11 @@ class BatchedPostprocessor:
                     )
                 with profiler.stage("postprocess_geometry_d2h", cuda=False):
                     gpu_records = self._gpu_geometry.materialize_compact(
-                        pending, records, frames
+                        pending,
+                        records,
+                        frames,
+                        copy_points=self._compact_copy_points,
+                        copy_voxels=self._compact_copy_voxels,
                     )
 
                 for record, item in zip(records, gpu_records):
@@ -1029,6 +1041,7 @@ class BatchedPostprocessor:
                             np.ascontiguousarray(item.voxel_keys, dtype=np.uint64)
                             if item.voxel_keys is not None else None
                         ),
+                        centroid_world=item.centroid_world,
                         voxel_points=item.voxel_points,
                         voxel_colors=item.voxel_colors,
                         voxel_bbox_min=item.voxel_bbox_min,
@@ -1345,7 +1358,14 @@ class BatchedPostprocessor:
         )
         need_final_masks = not lazy_common_frame
 
-        with profiler.stage("postprocess_total", cuda=False):
+        # ``postprocess_total`` is measured on the GPU timeline: its start event
+        # only fires once the tracker's kernels have drained, so the time the host
+        # spends here waiting for the tracker GPU tail (the tracker no longer
+        # blocks on a presence D2H) is not double-counted against
+        # ``tracker_propagate``. ``postprocess_wall`` keeps the host-side view.
+        with profiler.stage("postprocess_wall", cuda=False), profiler.stage(
+            "postprocess_total", cuda=self.mask_stage_cuda
+        ):
             with profiler.stage(
                 "postprocess_masks", cuda=self.mask_stage_cuda
             ):

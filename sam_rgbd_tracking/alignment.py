@@ -19,19 +19,56 @@ except ImportError:  # pragma: no cover
     torch = None
 
 
+# GPU-alignment mode: deduplicate voxels shared by several cameras before Chamfer
+# staging (legacy semantics; costs an np.unique + gather kernels per group) or
+# simply concatenate the member clouds (default; zero kernels — DifFlow's voxel-2
+# collapses duplicates on its own grid, the Chamfer gate is only marginally
+# reweighted).
+GPU_FUSION_DEDUP = False
+
+
+def gpu_alignment_enabled(config) -> bool:
+    """GPU-resident cross-view fusion / Chamfer staging (production default).
+
+    Requires the CUDA geometry backend and visualization off (visualization
+    consumes NumPy clouds). ``postprocess.gpu_alignment: false`` restores the
+    legacy path where voxel representatives are copied to the host, fused in
+    NumPy and uploaded again for Chamfer.
+    """
+    if torch is None or not torch.cuda.is_available():
+        return False
+    if not str(config.runtime.get("device", "cuda")).startswith("cuda"):
+        return False
+    if bool(config.runtime.get("enable_visualization", True)):
+        return False
+    postprocess = config.get("postprocess", {})
+    return bool(postprocess.get("gpu_geometry", True)) and bool(
+        postprocess.get("gpu_alignment", True)
+    )
+
+
 @dataclass(slots=True)
 class _VoxelObservation:
     view_index: int
     camera_name: str
     instance: ProcessedInstance
-    coords: np.ndarray
-    keys: np.ndarray
-    points: np.ndarray
+    # coords/keys/bbox are None only in GPU-alignment mode with a single camera
+    # (no cross-view matching happens, so no CPU voxel data is materialized).
+    coords: np.ndarray | None
+    keys: np.ndarray | None
+    # NumPy voxel representatives; None in GPU-alignment mode (see points_gpu).
+    points: np.ndarray | None
     colors: np.ndarray
-    bbox_min: np.ndarray
-    bbox_max: np.ndarray
+    bbox_min: np.ndarray | None
+    bbox_max: np.ndarray | None
     coverage_origin: np.ndarray | None = None
     coverage_grid: np.ndarray | None = None
+    # CUDA view of the same unique representatives (GPU-alignment mode).
+    points_gpu: Any | None = None
+    # The dense coverage grid is only needed when this observation is the target
+    # of a cross-view score; it is built lazily on first use (see
+    # ``SharedWorldVoxelizer.ensure_coverage``) instead of on every frame.
+    coverage_built: bool = False
 
 
 class SharedWorldVoxelizer:
@@ -181,7 +218,7 @@ class SharedWorldVoxelizer:
         if (
             instance.voxel_coords is not None
             and instance.voxel_keys is not None
-            and instance.voxel_points is not None
+            and (instance.voxel_points is not None or instance.voxel_points_gpu is not None)
             and instance.voxel_bbox_min is not None
             and instance.voxel_bbox_max is not None
         ):
@@ -210,28 +247,6 @@ class SharedWorldVoxelizer:
                 bbox_min,
                 bbox_max,
             ) = prepared
-        coverage_origin = None
-        coverage_grid = None
-        if self.max_local_dense_voxels > 0:
-            radius = self.match_radius
-            local_min = bbox_min - radius
-            local_max = bbox_max + radius
-            shape = (local_max - local_min + 1).astype(np.int64)
-            volume = int(np.prod(shape, dtype=np.int64))
-            if 0 < volume <= self.max_local_dense_voxels:
-                occupancy = np.zeros(tuple(int(v) for v in shape), dtype=np.uint8)
-                local = unique_coords - local_min[None, :]
-                occupancy[local[:, 0], local[:, 1], local[:, 2]] = 1
-                if radius > 0:
-                    occupancy = maximum_filter(
-                        occupancy,
-                        size=2 * radius + 1,
-                        mode="constant",
-                        cval=0,
-                    )
-                coverage_origin = local_min
-                coverage_grid = occupancy
-
         return _VoxelObservation(
             view_index=int(view_index),
             camera_name=str(camera_name),
@@ -242,9 +257,64 @@ class SharedWorldVoxelizer:
             colors=unique_colors,
             bbox_min=bbox_min,
             bbox_max=bbox_max,
-            coverage_origin=coverage_origin,
-            coverage_grid=coverage_grid,
+            points_gpu=instance.voxel_points_gpu,
         )
+
+    @staticmethod
+    def observe_gpu_only(
+        view_index: int,
+        camera_name: str,
+        instance: ProcessedInstance,
+    ) -> _VoxelObservation | None:
+        """Single-camera GPU-alignment observation: no CPU voxel data at all."""
+        points_gpu = instance.voxel_points_gpu
+        if points_gpu is None or int(points_gpu.shape[0]) == 0:
+            return None
+        return _VoxelObservation(
+            view_index=int(view_index),
+            camera_name=str(camera_name),
+            instance=instance,
+            coords=None,
+            keys=None,
+            points=None,
+            colors=np.empty((0, 3), dtype=np.uint8),
+            bbox_min=None,
+            bbox_max=None,
+            points_gpu=points_gpu,
+        )
+
+    def ensure_coverage(self, observation: _VoxelObservation) -> None:
+        """Build the dilated dense occupancy grid for ``observation`` on demand.
+
+        Previously built eagerly for every observation on every frame: a ~1 MB
+        ``np.zeros`` + scipy ``maximum_filter`` (3-5 ms) for objects that fit the
+        ``max_local_dense_voxels`` cap, even with a single camera where no
+        cross-view score is ever computed.
+        """
+        if observation.coverage_built:
+            return
+        observation.coverage_built = True
+        if self.max_local_dense_voxels <= 0:
+            return
+        radius = self.match_radius
+        local_min = observation.bbox_min - radius
+        local_max = observation.bbox_max + radius
+        shape = (local_max - local_min + 1).astype(np.int64)
+        volume = int(np.prod(shape, dtype=np.int64))
+        if not (0 < volume <= self.max_local_dense_voxels):
+            return
+        occupancy = np.zeros(tuple(int(v) for v in shape), dtype=np.uint8)
+        local = observation.coords - local_min[None, :]
+        occupancy[local[:, 0], local[:, 1], local[:, 2]] = 1
+        if radius > 0:
+            occupancy = maximum_filter(
+                occupancy,
+                size=2 * radius + 1,
+                mode="constant",
+                cval=0,
+            )
+        observation.coverage_origin = local_min
+        observation.coverage_grid = occupancy
 
     def bbox_compatible(self, a: _VoxelObservation, b: _VoxelObservation) -> bool:
         radius = self.match_radius
@@ -275,6 +345,7 @@ class SharedWorldVoxelizer:
 
         # Fast path for compact objects: target.coverage_grid is already dilated
         # by match_radius, so coverage is one bounds check + indexed gather.
+        self.ensure_coverage(target)
         if target.coverage_grid is not None and target.coverage_origin is not None:
             local = source.coords - target.coverage_origin[None, :]
             shape = np.asarray(target.coverage_grid.shape, dtype=np.int64)
@@ -329,6 +400,13 @@ class CrossViewAligner:
         self.visualization_enabled = bool(
             config.runtime.get("enable_visualization", True)
         )
+        self.gpu_fusion = gpu_alignment_enabled(config)
+        self.device = (
+            torch.device(str(config.runtime.get("device", "cuda")))
+            if self.gpu_fusion
+            else None
+        )
+        self._centroid_host = None  # pinned staging for batched centroid D2H
 
     def align(
         self,
@@ -342,14 +420,23 @@ class CrossViewAligner:
             if profiler is not None
             else _NullContext()
         )
+        # With one camera no cross-view matching can happen, so GPU-alignment
+        # mode skips CPU voxel data entirely (the geometry stage did not even
+        # copy it back). Multi-camera GPU mode still matches on CPU keys/coords.
+        gpu_single_view = self.gpu_fusion and len(results) == 1
         with context:
             for view_index, result in enumerate(results):
                 for instance in result.instances:
-                    voxelized = self.voxelizer.voxelize(
-                        view_index,
-                        result.frame.camera_name,
-                        instance,
-                    )
+                    if gpu_single_view:
+                        voxelized = self.voxelizer.observe_gpu_only(
+                            view_index, result.frame.camera_name, instance
+                        )
+                    else:
+                        voxelized = self.voxelizer.voxelize(
+                            view_index,
+                            result.frame.camera_name,
+                            instance,
+                        )
                     if voxelized is not None:
                         observations.append(voxelized)
 
@@ -496,7 +583,11 @@ class CrossViewAligner:
         )
         fused: list[MultiViewInstance] = []
         with fusion_context:
+            if self.gpu_fusion:
+                fused = self._fuse_groups_gpu(list(groups.values()), counters)
             for group_index, members in enumerate(groups.values(), start=1):
+                if self.gpu_fusion:
+                    break
                 local_members = [member.instance for member in members]
                 raw_point_count = sum(
                     int(len(member.instance.points_world))
@@ -578,6 +669,7 @@ class CrossViewAligner:
                     centroid_world=centroid,
                     bbox_min=bbox_min,
                     bbox_max=bbox_max,
+                    point_count=int(len(points_world)),
                 )
                 for member in local_members:
                     member.multiview_group_id = group_index
@@ -589,6 +681,143 @@ class CrossViewAligner:
                 1000.0 * (time.perf_counter() - started),
             )
         return fused, counters
+
+    def _fuse_groups_gpu(
+        self,
+        groups: list[list[_VoxelObservation]],
+        counters: dict[str, int],
+    ) -> list[MultiViewInstance]:
+        """Cross-view fusion without moving any point cloud through the host.
+
+        Single-member groups (the common case) alias the geometry backend's
+        unique-representative slice. Multi-member groups reuse the exact voxel
+        key union computed on CPU for matching (``np.unique`` on int64 keys) and
+        gather the survivors on device. Centroids are medians computed on the
+        GPU and copied back in one batched transfer.
+        """
+        assert torch is not None and self.device is not None
+        fused: list[MultiViewInstance] = []
+        clouds: list[Any] = []
+        # Groups whose centroid could not be derived from per-record means
+        # (legacy geometry backend without record centroids) fall back to a GPU
+        # median + one batched readback below.
+        need_gpu_centroid: list[int] = []
+        for group_index, members in enumerate(groups, start=1):
+            raw_point_count = 0
+            for member in members:
+                if member.instance.points_world is not None:
+                    raw_point_count += int(len(member.instance.points_world))
+                elif member.points_gpu is not None:
+                    raw_point_count += int(member.points_gpu.shape[0])
+            counters["num_fused_points_before_downsample"] += raw_point_count
+
+            member_clouds = [
+                member.points_gpu for member in members if member.points_gpu is not None
+            ]
+            member_list = None
+            if len(member_clouds) == 0:
+                fused_gpu = torch.empty((0, 3), dtype=torch.float32, device=self.device)
+                count = 0
+            elif len(member_clouds) == 1:
+                fused_gpu = member_clouds[0]
+                count = int(fused_gpu.shape[0])
+            elif GPU_FUSION_DEDUP:
+                # Key union on CPU (keys are already resident for matching);
+                # the survivor gather stays on device.
+                fused_keys = np.concatenate([member.keys for member in members], axis=0)
+                _, keep = np.unique(fused_keys, return_index=True)
+                keep.sort()
+                # Pinned staging + non-blocking copy: a pageable ``.to()`` would
+                # block the host on the (possibly contended) stream.
+                keep_gpu = self._stage_index(keep)
+                fused_gpu = torch.cat(member_clouds, dim=0).index_select(0, keep_gpu)
+                count = int(fused_gpu.shape[0])
+            else:
+                # No kernels here: the bank staging concatenates the member
+                # slices with plain D2D copies (copy engine, not SMs), which is
+                # what keeps this stage cheap while SAM3 occupies the GPU.
+                fused_gpu = None
+                member_list = member_clouds
+                count = int(sum(int(cloud.shape[0]) for cloud in member_clouds))
+            counters["num_fused_points_after_downsample"] += count
+            clouds.append(fused_gpu if (count and fused_gpu is not None) else None)
+
+            # Centroid: count-weighted combination of the per-record means that
+            # the geometry stage already shipped with its metadata. No GPU work
+            # and no host wait here; under SAM3 contention every extra small
+            # kernel + sync in this stage cost milliseconds.
+            centroid = None
+            member_centroids = [
+                (member.instance.centroid_world, int(member.points_gpu.shape[0]))
+                for member in members
+                if member.points_gpu is not None and member.instance.centroid_world is not None
+            ]
+            if count and member_centroids and len(member_centroids) == len(member_clouds):
+                weights = np.asarray([w for _, w in member_centroids], dtype=np.float64)
+                stacked = np.stack([c for c, _ in member_centroids]).astype(np.float64)
+                centroid = (stacked * weights[:, None]).sum(0) / max(1.0, weights.sum())
+                centroid = centroid.astype(np.float32)
+            elif count and fused_gpu is not None:
+                need_gpu_centroid.append(len(fused))
+            elif count:
+                # Multi-member without record means and without a fused tensor:
+                # fall back to the (deduplicating) gather so a centroid exists.
+                fused_gpu = torch.cat(member_list, dim=0)
+                member_list = None
+                clouds[-1] = fused_gpu
+                need_gpu_centroid.append(len(fused))
+
+            group = MultiViewInstance(
+                group_id=group_index,
+                semantic_label=members[0].instance.label,
+                members=[(member.camera_name, member.instance) for member in members],
+                points_world=None,
+                colors_rgb=np.empty((0, 3), dtype=np.uint8),
+                centroid_world=centroid,
+                bbox_min=None,
+                bbox_max=None,
+                point_count=count,
+                fused_points_gpu=fused_gpu,
+                fused_member_clouds_gpu=member_list,
+            )
+            for member in members:
+                member.instance.multiview_group_id = group_index
+            fused.append(group)
+
+        # Fallback centroid readback (only when record means were unavailable).
+        valid = [index for index in need_gpu_centroid if clouds[index] is not None]
+        if valid:
+            medians = torch.stack(
+                [torch.quantile(clouds[index], 0.5, dim=0) for index in valid], dim=0
+            )
+            host = self._centroid_host
+            if host is None or host.shape[0] < len(valid):
+                host = torch.empty((max(8, 2 * len(valid)), 3), dtype=torch.float32, pin_memory=True)
+                self._centroid_host = host
+            host[: len(valid)].copy_(medians, non_blocking=True)
+            done = torch.cuda.Event()
+            done.record(torch.cuda.current_stream(self.device))
+            done.synchronize()
+            centroids = host[: len(valid)].numpy()
+            for row, index in enumerate(valid):
+                fused[index].centroid_world = np.array(centroids[row], dtype=np.float32, copy=True)
+        return fused
+
+    def _stage_index(self, keep: np.ndarray):
+        """Upload an int64 index array through a reusable pinned buffer (non-blocking)."""
+        assert torch is not None and self.device is not None
+        n = int(keep.shape[0])
+        host = getattr(self, "_index_host", None)
+        if host is None or host.shape[0] < n:
+            host = torch.empty(max(4096, 2 * n), dtype=torch.int64, pin_memory=True)
+            self._index_host = host
+            self._index_dev = torch.empty(host.shape[0], dtype=torch.int64, device=self.device)
+        host[:n].numpy()[:] = keep
+        dev = self._index_dev[:n]
+        dev.copy_(host[:n], non_blocking=True)
+        # The staging buffer is reused next frame; the copy has completed long
+        # before then (the frame ends with a stream fence).
+        return dev
 
 
 class _ChamferWorkspace:
@@ -840,6 +1069,49 @@ class _ChamferWorkspace:
             assert self.device is not None
             self.current_ready_event.record(torch.cuda.current_stream(self.device))
 
+    def stage_current_gpu(self, clouds: list[Any], counts: list[int]) -> None:
+        """Stage CUDA-resident fused clouds into the current bank by D2D copy.
+
+        Same layout/semantics as ``stage_current`` but without the host pack
+        and H2D upload; the counts are already known on the host (they came
+        back with the geometry metadata), so only the tiny count vector is
+        uploaded.
+        """
+        if not self.cuda_enabled:
+            return
+        self._check_instance_count(len(clouds))
+        self._ensure_ready_events()
+        counts_np = np.asarray(counts, dtype=np.int64)
+        max_points = int(counts_np.max(initial=0))
+        self._ensure_point_capacity(max(1, max_points))
+        assert self.gpu_current is not None and self.gpu_current_count is not None
+        assert self.host_current_count is not None
+        current_size = len(clouds)
+        for index, (cloud, count) in enumerate(zip(clouds, counts)):
+            if not count:
+                continue
+            if isinstance(cloud, (list, tuple)):
+                # Multi-camera group: concatenate member slices into the row.
+                offset = 0
+                for part in cloud:
+                    n = int(part.shape[0])
+                    if n:
+                        self.gpu_current[index, offset : offset + n].copy_(part, non_blocking=True)
+                        offset += n
+            else:
+                self.gpu_current[index, :count].copy_(cloud[:count], non_blocking=True)
+        if current_size:
+            host_count = self.host_current_count[:current_size]
+            host_count.numpy()[:] = counts_np
+            self.gpu_current_count[:current_size].copy_(
+                host_count, non_blocking=host_count.is_pinned()
+            )
+        self.current_size = current_size
+        self.current_counts_np = counts_np
+        if current_size and self.current_ready_event is not None:
+            assert self.device is not None
+            self.current_ready_event.record(torch.cuda.current_stream(self.device))
+
     def promote_current(self) -> None:
         """Make the just-uploaded current bank the next frame's resident previous."""
         if not self.cuda_enabled:
@@ -1078,7 +1350,23 @@ class CrossFrameAligner:
             else _NullContext()
         )
         with context:
-            self.workspace.stage_current([item.points_world for item in current])
+            gpu_mode = bool(current) and all(
+                item.fused_points_gpu is not None or item.fused_member_clouds_gpu is not None
+                for item in current
+            )
+            if gpu_mode:
+                # GPU-alignment mode: fused clouds never left the device.
+                self.workspace.stage_current_gpu(
+                    [
+                        item.fused_member_clouds_gpu
+                        if item.fused_member_clouds_gpu is not None
+                        else item.fused_points_gpu
+                        for item in current
+                    ],
+                    [int(item.point_count) for item in current],
+                )
+            else:
+                self.workspace.stage_current([item.points_world for item in current])
 
         # Export zero-copy views of the bank that was already required for
         # Chamfer. ScenePredictor reuses these views instead of uploading the
@@ -1095,6 +1383,9 @@ class CrossFrameAligner:
         for item, view in zip(current, views):
             item.points_world_gpu = view
             item.points_world_gpu_ready_event = ready_event
+            if item.fused_member_clouds_gpu is not None:
+                # The concatenated bank row is the fused cloud from here on.
+                item.fused_points_gpu = view
 
     def align(
         self,

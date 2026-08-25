@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -34,6 +35,7 @@ class FrameProfiler:
         "tracker_direct_correction",
         "postprocess_alignment_total",
         "postprocess_total",
+        "postprocess_wall",
         "postprocess_masks",
         "postprocess_components",
         "postprocess_geometry",
@@ -102,6 +104,10 @@ class FrameProfiler:
         self._history_frames: dict[str, list[int]] = {}
         self._current_cpu: dict[str, float] = {}
         self._current_cuda: dict[str, list[tuple[object, object]]] = {}
+        self._event_pool: dict[str, list[tuple[object, object]]] = {}
+        self._event_use: dict[str, int] = {}
+        # CSV flushes run on this single background thread instead of the frame path.
+        self._io_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="profiler-io")
         self._frame_start = 0.0
         # _seen_frames counts every completed runtime frame. _frames counts only
         # frames admitted to statistics after warm-up.
@@ -118,6 +124,19 @@ class FrameProfiler:
         self._frame_start = time.perf_counter()
         self._current_cpu = {}
         self._current_cuda = {}
+        for name in self._event_use:
+            self._event_use[name] = 0
+
+    def _acquire_events(self, name: str):
+        """Reuse a (start, end) CUDA event pair per stage name and per-frame call index."""
+        pool = self._event_pool.setdefault(name, [])
+        index = self._event_use.get(name, 0)
+        self._event_use[name] = index + 1
+        if index >= len(pool):
+            pool.append(
+                (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+            )
+        return pool[index]
 
     def record(self, name: str, value_ms: float) -> None:
         """Add an already measured CPU/wall-clock duration to this frame."""
@@ -138,8 +157,7 @@ class FrameProfiler:
             and torch.cuda.is_available()
         )
         if can_cuda:
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
+            start, end = self._acquire_events(name)
             start.record()
             try:
                 yield
@@ -206,9 +224,10 @@ class FrameProfiler:
                 and self._frames % self.interval == 0
             )
 
-        # File I/O and summary formatting are deliberately outside the state lock.
+        # File I/O and summary formatting are deliberately outside the state lock
+        # and off the frame thread (the flush used to cost 1-5 ms every 100 frames).
         if flush_csv:
-            self._flush_csv()
+            self._io_executor.submit(self._flush_csv)
         if print_now:
             self.print_summary()
         return timings
@@ -262,6 +281,7 @@ class FrameProfiler:
 
     def close(self) -> None:
         """Flush any buffered profiler rows without changing timing statistics."""
+        self._io_executor.shutdown(wait=True)
         self._flush_csv()
 
     @staticmethod

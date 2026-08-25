@@ -46,11 +46,52 @@ class TrackerSeed:
     confidence: float = 1.0
 
 
+class LazyPresence:
+    """Per-object presence vector whose device->host copy resolves on first read.
+
+    The tracker enqueues a ``non_blocking`` copy into pinned memory and records an
+    event; nothing blocks until a consumer indexes the values (postprocess
+    finalize, after the geometry stage has already drained the stream). This
+    removes a per-view blocking ``.cpu()`` from inside the tracker step, which
+    previously forced the host to wait for the whole EfficientTAM forward before
+    the mask/geometry work could be enqueued.
+    """
+
+    __slots__ = ("_host", "_event", "_resolved")
+
+    def __init__(self, host: Any, event: Any) -> None:
+        self._host = host          # pinned torch tensor view, 1-D
+        self._event = event        # torch.cuda.Event recorded after the copy
+        self._resolved = False
+
+    def resolve(self) -> np.ndarray:
+        if not self._resolved:
+            if self._event is not None:
+                self._event.synchronize()
+            self._host = self._host.numpy() if hasattr(self._host, "numpy") else np.asarray(self._host)
+            self._resolved = True
+        return self._host
+
+    @property
+    def size(self) -> int:
+        return int(self._host.shape[0])
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __getitem__(self, index):
+        return self.resolve()[index]
+
+    def __array__(self, dtype=None, copy=None):
+        values = self.resolve()
+        return values.astype(dtype, copy=False) if dtype is not None else values
+
+
 @dataclass
 class TrackerPrediction:
     track_ids: list[int]
     mask_logits: Any
-    presence_scores: np.ndarray
+    presence_scores: np.ndarray | LazyPresence
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -130,12 +171,26 @@ class MultiViewInstance:
     group_id: int
     semantic_label: str
     members: list[tuple[str, ProcessedInstance]]
-    points_world: np.ndarray
+    # NumPy fused cloud. ``None`` in GPU-alignment mode (production), where the
+    # fused cloud only exists on CUDA (``fused_points_gpu`` / ``points_world_gpu``).
+    points_world: np.ndarray | None
     colors_rgb: np.ndarray
     centroid_world: np.ndarray | None
     bbox_min: np.ndarray | None
     bbox_max: np.ndarray | None
     global_track_id: int | None = None
+    # Number of fused points, valid in both modes.
+    point_count: int = 0
+    # GPU-alignment mode: the fused cloud as produced by cross-view fusion
+    # (a view into the geometry backend's unique-representative buffer for
+    # single-member groups, a gathered tensor otherwise). Consumed by the
+    # Chamfer bank staging (D2D); overwritten by the next frame's geometry.
+    # After bank staging this is the bank view (same object as points_world_gpu).
+    fused_points_gpu: Any | None = None
+    # GPU-alignment mode, multi-camera groups: the member clouds to concatenate
+    # into the bank row (no cross-view voxel dedup; DifFlow's voxel-2 dedups on
+    # its own grid). None for single-member groups.
+    fused_member_clouds_gpu: list | None = None
     # Optional zero-copy view into CrossFrameAligner's persistent CUDA bank.
     # Cross-view fusion remains entirely CPU; this view is attached only after
     # the fused CPU cloud has already been uploaded for GPU Chamfer.

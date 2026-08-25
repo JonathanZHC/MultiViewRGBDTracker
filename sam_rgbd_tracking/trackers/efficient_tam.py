@@ -13,7 +13,7 @@ try:
 except ImportError:  # pragma: no cover
     torch = None
 
-from ..data_types import TrackerPrediction, TrackerSeed
+from ..data_types import LazyPresence, TrackerPrediction, TrackerSeed
 from .base import GLOBAL_CUDA_LOCK, current_tracker_profiler
 from .sam2_adapter import Sam2StyleStreamingTracker
 from .streaming_state import BatchedStreamingPreprocessor, StreamingVideoState
@@ -653,6 +653,38 @@ class EfficientTAMMultiViewTracker(EfficientTAMTracker):
             )
         return int(frame_indices[0])
 
+    _PRESENCE_RING_SLOTS: ClassVar[int] = 8
+
+    def _stage_presence(self, values: "torch.Tensor") -> LazyPresence:
+        """Enqueue a non-blocking D2H of ``values`` into a pinned ring slot.
+
+        Slots are reused after ``_PRESENCE_RING_SLOTS`` calls (4 frames at two
+        views); consumers read presence within the same frame, so a slot is never
+        overwritten before it has been resolved.
+        """
+        count = int(values.shape[0])
+        ring = getattr(self, "_presence_ring", None)
+        if ring is None or ring[0].shape[0] < count:
+            capacity = max(count, 8)
+            self._presence_ring = [
+                torch.empty(capacity, dtype=torch.float32, pin_memory=True)
+                for _ in range(self._PRESENCE_RING_SLOTS)
+            ]
+            self._presence_events = [
+                torch.cuda.Event() for _ in range(self._PRESENCE_RING_SLOTS)
+            ]
+            self._presence_pos = 0
+            ring = self._presence_ring
+        pos = self._presence_pos
+        self._presence_pos = (pos + 1) % self._PRESENCE_RING_SLOTS
+        event = self._presence_events[pos]
+        # Make sure the previous copy into this slot has landed (it did frames ago).
+        event.synchronize()
+        host = ring[pos][:count]
+        host.copy_(values.to(torch.float32), non_blocking=True)
+        event.record(torch.cuda.current_stream(values.device))
+        return LazyPresence(host, event)
+
     def _prediction_from_view_result(
         self,
         result: dict[str, Any],
@@ -678,14 +710,18 @@ class EfficientTAMMultiViewTracker(EfficientTAMTracker):
                     f"Unexpected EfficientTAM mask shape: {tuple(masks.shape)}"
                 )
             # Presence is a tiny O-vector; computing it on device avoids a full
-            # logits D2H while preserving the existing heuristic exactly.
-            flat = masks.float().reshape(masks.shape[0], -1)
+            # logits D2H while preserving the existing heuristic exactly. The
+            # D2H itself is non-blocking into a pinned ring and resolves lazily on
+            # first read (postprocess finalize), so this call no longer drains the
+            # stream behind the whole EfficientTAM forward.
+            flat = masks.reshape(masks.shape[0], -1)
             positive_fraction = (flat > 0).float().mean(dim=1)
-            peak = flat.amax(dim=1)
-            presence = (
+            peak = flat.amax(dim=1).float()
+            presence_gpu = (
                 torch.sigmoid(peak.clamp(-20.0, 20.0))
                 * (positive_fraction * 20.0).clamp(0.0, 1.0)
-            ).cpu().numpy().astype(np.float32, copy=False)
+            )
+            presence = self._stage_presence(presence_gpu)
         else:
             masks = self._to_numpy_logits(value)
             presence = self._presence_from_logits(masks)

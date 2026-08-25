@@ -108,6 +108,9 @@ postprocess:
 
   # Frozen CUDA geometry path. Set false only for standalone CPU/debug fallback.
   gpu_geometry: true
+  # GPU-resident cross-view fusion / Chamfer staging (see alignment.py
+  # gpu_alignment_enabled). false = legacy NumPy fusion with host round trip.
+  gpu_alignment: true
 
   # Eroded masks and prefetched depth feed the fused Warp
   # geometry backend directly. Compact voxel D2H and lazy CPU masks are
