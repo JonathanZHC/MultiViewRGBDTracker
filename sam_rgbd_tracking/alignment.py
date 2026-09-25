@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import time
 from dataclasses import dataclass
@@ -25,6 +26,8 @@ except ImportError:  # pragma: no cover
 # collapses duplicates on its own grid, the Chamfer gate is only marginally
 # reweighted).
 GPU_FUSION_DEDUP = False
+
+logger = logging.getLogger(__name__)
 
 
 def gpu_alignment_enabled(config) -> bool:
@@ -92,6 +95,21 @@ class SharedWorldVoxelizer:
         self.min_bidirectional_coverage = float(
             cfg.get("min_bidirectional_coverage", 0.20)
         )
+        # Cross-view association test. "containment" (default): intersection volume of the two
+        # observations' world AABBs divided by the SMALLER box volume. It stays high when the
+        # visible surfaces do not overlap at all (a human seen from the front by one camera and
+        # from the back by the other: the boxes coincide, the surfaces are a body depth apart)
+        # and when one camera sees only part of the object (its box lies inside the other).
+        # "coverage": legacy bidirectional voxel-surface coverage on the shared 5 mm lattice.
+        self.association = str(cfg.get("association", "containment"))
+        if self.association not in ("containment", "coverage"):
+            raise ValueError("shared_voxel_grid.association must be 'containment' or 'coverage'")
+        self.min_containment_ratio = float(cfg.get("min_containment_ratio", 0.5))
+        # Temporal hysteresis of a cross-view pairing, keyed by the per-camera slots (EfficientTAM
+        # keeps a slot on the same object over time): merge after this many consecutive passing
+        # frames, split after this many consecutive failing frames.
+        self.merge_confirm_frames = max(1, int(cfg.get("merge_confirm_frames", 2)))
+        self.split_confirm_frames = max(1, int(cfg.get("split_confirm_frames", 5)))
         # Sparse voxel keys remain canonical. For compact object extents, derive
         # a tiny *local* dilated occupancy cache to make neighborhood coverage O(N)
         # rather than O(27*N*logN). This is never a global dense world volume.
@@ -316,6 +334,20 @@ class SharedWorldVoxelizer:
         observation.coverage_origin = local_min
         observation.coverage_grid = occupancy
 
+    def containment_ratio(self, a: _VoxelObservation, b: _VoxelObservation) -> float:
+        """Intersection volume of the two voxel AABBs over the smaller AABB volume, in [0, 1].
+        Boxes are inclusive voxel index ranges, so one voxel has extent 1."""
+        if a.bbox_min is None or b.bbox_min is None:
+            return 0.0
+        lo = np.maximum(a.bbox_min, b.bbox_min)
+        hi = np.minimum(a.bbox_max, b.bbox_max)
+        inter = np.prod(np.maximum(hi - lo + 1, 0).astype(np.float64))
+        if inter <= 0.0:
+            return 0.0
+        vol_a = np.prod((a.bbox_max - a.bbox_min + 1).astype(np.float64))
+        vol_b = np.prod((b.bbox_max - b.bbox_min + 1).astype(np.float64))
+        return float(inter / max(1.0, min(vol_a, vol_b)))
+
     def bbox_compatible(self, a: _VoxelObservation, b: _VoxelObservation) -> bool:
         radius = self.match_radius
         return bool(
@@ -392,8 +424,17 @@ class SharedWorldVoxelizer:
         return 0.5 * (a_to_b + b_to_a), a_to_b, b_to_a
 
 
+@dataclass
+class _PairState:
+    agree: int = 0
+    disagree: int = 0
+    merged: bool = False
+    last_frame: int = 0
+
+
 class CrossViewAligner:
-    """Class gate -> sparse world voxel geometry -> Hungarian -> fusion."""
+    """Class gate -> AABB containment with per-slot hysteresis (or legacy voxel coverage)
+    -> Hungarian -> constrained union-find -> fusion."""
 
     def __init__(self, config) -> None:
         self.voxelizer = SharedWorldVoxelizer(config)
@@ -407,6 +448,38 @@ class CrossViewAligner:
             else None
         )
         self._centroid_host = None  # pinned staging for batched centroid D2H
+        # (view_a, slot_a, view_b, slot_b) -> _PairState; the hysteresis memory of the
+        # containment association (see SharedWorldVoxelizer.association).
+        self._pairs: dict[tuple[int, int, int, int], _PairState] = {}
+        self._frame = 0
+
+    def _pair_passes(self, key: tuple[int, int, int, int], passed: bool, label: str, score: float) -> bool:
+        """Update the hysteresis state of one cross-view pair; return whether it counts as merged."""
+        state = self._pairs.get(key)
+        if state is None:
+            state = self._pairs[key] = _PairState()
+        state.last_frame = self._frame
+        if passed:
+            state.agree += 1
+            state.disagree = 0
+            if not state.merged and state.agree >= self.voxelizer.merge_confirm_frames:
+                state.merged = True
+                logger.info("cross-view merge: %s view%d[slot %d] + view%d[slot %d] (containment %.2f)",
+                            label, key[0], key[1], key[2], key[3], score)
+        else:
+            state.disagree += 1
+            state.agree = 0
+            if state.merged and state.disagree >= self.voxelizer.split_confirm_frames:
+                state.merged = False
+                logger.info("cross-view split: %s view%d[slot %d] | view%d[slot %d] (containment %.2f)",
+                            label, key[0], key[1], key[2], key[3], score)
+        return state.merged
+
+    def _prune_pairs(self) -> None:
+        if self._frame % 300 == 0:
+            stale = [k for k, st in self._pairs.items() if self._frame - st.last_frame > 300]
+            for k in stale:
+                del self._pairs[k]
 
     def align(
         self,
@@ -415,6 +488,9 @@ class CrossViewAligner:
     ) -> tuple[list[MultiViewInstance], dict[str, int]]:
         observations: list[_VoxelObservation] = []
         started = time.perf_counter()
+        self._frame += 1
+        self._prune_pairs()
+        containment = self.voxelizer.association == "containment"
         context = (
             profiler.stage("cross_view_voxelize", cuda=False)
             if profiler is not None
@@ -487,31 +563,44 @@ class CrossViewAligner:
                 scores = np.full(
                     (len(class_a), len(class_b)), -1.0, dtype=np.float32
                 )
-                directional_min = np.zeros_like(scores)
-                for row, index_a in enumerate(class_a):
-                    obs_a = observations[index_a]
-                    for col, index_b in enumerate(class_b):
-                        obs_b = observations[index_b]
-                        if not self.voxelizer.bbox_compatible(obs_a, obs_b):
-                            continue
-                        counters["num_cross_view_candidate_pairs"] += 1
-                        match_started = time.perf_counter()
-                        score, a_to_b, b_to_a = self.voxelizer.symmetric_score(
-                            obs_a, obs_b
+                if containment:
+                    valid = np.zeros(scores.shape, dtype=bool)
+                    for row, index_a in enumerate(class_a):
+                        obs_a = observations[index_a]
+                        for col, index_b in enumerate(class_b):
+                            obs_b = observations[index_b]
+                            counters["num_cross_view_candidate_pairs"] += 1
+                            ratio = self.voxelizer.containment_ratio(obs_a, obs_b)
+                            scores[row, col] = ratio
+                            key = (view_a, int(obs_a.instance.track_id), view_b, int(obs_b.instance.track_id))
+                            valid[row, col] = self._pair_passes(
+                                key, ratio >= self.voxelizer.min_containment_ratio, label, ratio
+                            )
+                else:
+                    directional_min = np.zeros_like(scores)
+                    for row, index_a in enumerate(class_a):
+                        obs_a = observations[index_a]
+                        for col, index_b in enumerate(class_b):
+                            obs_b = observations[index_b]
+                            if not self.voxelizer.bbox_compatible(obs_a, obs_b):
+                                continue
+                            counters["num_cross_view_candidate_pairs"] += 1
+                            match_started = time.perf_counter()
+                            score, a_to_b, b_to_a = self.voxelizer.symmetric_score(
+                                obs_a, obs_b
+                            )
+                            voxel_match_ms += 1000.0 * (
+                                time.perf_counter() - match_started
+                            )
+                            scores[row, col] = score
+                            directional_min[row, col] = min(a_to_b, b_to_a)
+                    valid = (
+                        (scores >= self.voxelizer.min_alignment_score)
+                        & (
+                            directional_min
+                            >= self.voxelizer.min_bidirectional_coverage
                         )
-                        voxel_match_ms += 1000.0 * (
-                            time.perf_counter() - match_started
-                        )
-                        scores[row, col] = score
-                        directional_min[row, col] = min(a_to_b, b_to_a)
-
-                valid = (
-                    (scores >= self.voxelizer.min_alignment_score)
-                    & (
-                        directional_min
-                        >= self.voxelizer.min_bidirectional_coverage
                     )
-                )
                 if not np.any(valid):
                     continue
                 cost = np.where(valid, 1.0 - scores, 1e6).astype(np.float32)
@@ -630,30 +719,9 @@ class CrossViewAligner:
 
                 if points_world.size > 0:
                     centroid = np.median(points_world, axis=0).astype(np.float32)
-                    if self.visualization_enabled:
-                        # The group already lives on one shared voxel lattice.
-                        # Reuse the union voxel bounds instead of two O(N)
-                        # quantile passes over the fused cloud every frame.
-                        voxel_min = np.min(
-                            np.stack([member.bbox_min for member in members], axis=0),
-                            axis=0,
-                        )
-                        voxel_max = np.max(
-                            np.stack([member.bbox_max for member in members], axis=0),
-                            axis=0,
-                        )
-                        bbox_min = (
-                            self.voxelizer.origin_world
-                            + voxel_min.astype(np.float32)
-                            * np.float32(self.voxelizer.voxel_size_m)
-                        )
-                        bbox_max = (
-                            self.voxelizer.origin_world
-                            + (voxel_max.astype(np.float32) + 1.0)
-                            * np.float32(self.voxelizer.voxel_size_m)
-                        )
-                    else:
-                        bbox_min = bbox_max = None
+                    # Union of the members' voxel bounds (the cross-frame tracker keys on the
+                    # AABB centre, which unlike the visible-surface centroid is view-invariant).
+                    bbox_min, bbox_max = self._union_bbox_world(members)
                 else:
                     centroid = None
                     bbox_min = None
@@ -767,6 +835,7 @@ class CrossViewAligner:
                 clouds[-1] = fused_gpu
                 need_gpu_centroid.append(len(fused))
 
+            bbox_min, bbox_max = self._union_bbox_world(members)
             group = MultiViewInstance(
                 group_id=group_index,
                 semantic_label=members[0].instance.label,
@@ -774,8 +843,8 @@ class CrossViewAligner:
                 points_world=None,
                 colors_rgb=np.empty((0, 3), dtype=np.uint8),
                 centroid_world=centroid,
-                bbox_min=None,
-                bbox_max=None,
+                bbox_min=bbox_min,
+                bbox_max=bbox_max,
                 point_count=count,
                 fused_points_gpu=fused_gpu,
                 fused_member_clouds_gpu=member_list,
@@ -802,6 +871,17 @@ class CrossViewAligner:
             for row, index in enumerate(valid):
                 fused[index].centroid_world = np.array(centroids[row], dtype=np.float32, copy=True)
         return fused
+
+    def _union_bbox_world(self, members: list[_VoxelObservation]):
+        """World-frame AABB (metres) of the union of the members' voxel boxes, or (None, None)."""
+        boxes = [(m.bbox_min, m.bbox_max) for m in members if m.bbox_min is not None and m.bbox_max is not None]
+        if not boxes:
+            return None, None
+        vmin = np.min(np.stack([b[0] for b in boxes], axis=0), axis=0).astype(np.float32)
+        vmax = np.max(np.stack([b[1] for b in boxes], axis=0), axis=0).astype(np.float32)
+        size = np.float32(self.voxelizer.voxel_size_m)
+        return (self.voxelizer.origin_world + vmin * size,
+                self.voxelizer.origin_world + (vmax + 1.0) * size)
 
     def _stage_index(self, keep: np.ndarray):
         """Upload an int64 index array through a reusable pinned buffer (non-blocking)."""
@@ -1311,14 +1391,42 @@ class _ChamferWorkspace:
         return np.asarray(values, dtype=np.float32)
 
 
+@dataclass
+class _Track:
+    track_id: int
+    label: str
+    bbox_min: np.ndarray        # last observed world AABB (m)
+    bbox_max: np.ndarray
+    created: int
+    hits: int = 1
+    misses: int = 0
+    last_seen_s: float = 0.0    # frame time of the last observation
+    coast_s: float = 0.0        # time unobserved
+
+
 class CrossFrameAligner:
-    """Class+centroid hard gate -> persistent-bank GPU Chamfer -> Hungarian."""
+    """Persistent global ids by AABB containment between consecutive observations.
+
+    No motion model: a track is its last observed world AABB. Oldest track first, every track
+    takes the unmatched same-class observation with the highest affinity, where the affinity is
+    the AABB containment ratio (intersection volume over the smaller box) and reaches 1.0 when
+    one box contains the other's centre (expanded by ``centre_margin_m``). At 30 fps a walking
+    person moves ~5 cm per frame, far less than a body box, so consecutive boxes overlap; a
+    mask that suddenly grows or shrinks keeps the smaller box inside the larger one. Unmatched
+    tracks keep their id for ``max_age_s`` (a missed detection or a brief occlusion), unmatched
+    observations start a new track; when two groups merge the survivor keeps the oldest id.
+
+    The persistent CUDA bank of fused clouds is still filled here (``_stage_current_bank``): the
+    ScenePredictor adapter consumes those views; only the Chamfer matching was retired.
+    """
 
     def __init__(self, config, *, num_views: int | None = None) -> None:
         cfg = config.get("cross_frame_alignment", {})
-        self.centroid_gate_m = float(cfg.get("centroid_gate_m", 0.20))
-        threshold = cfg.get("max_chamfer_m", None)
-        self.max_chamfer_m = None if threshold in (None, "", False) else float(threshold)
+        self.min_containment_ratio = float(cfg.get("min_containment_ratio",
+                                                   config.get("shared_voxel_grid", {}).get("min_containment_ratio", 0.5)))
+        self.centre_margin_m = float(cfg.get("centre_margin_m", 0.15))
+        self.max_age_s = float(cfg.get("max_age_s", 0.5))
+        self.nominal_dt_s = float(cfg.get("nominal_dt_s", 1.0 / 30.0))
         device = str(config.runtime.get("device", "cuda"))
         workspace_mb = float(cfg.get("chamfer_max_workspace_mb", 256.0))
         pair_capacity = max_cross_frame_candidate_pairs(config, num_views=num_views)
@@ -1332,10 +1440,61 @@ class CrossFrameAligner:
         self.workspace.reserve_points(int(cfg.get("chamfer_preallocate_points", 0)))
         self.previous: list[MultiViewInstance] = []
         self.next_global_track_id = 1
+        self.tracks: dict[int, _Track] = {}
+        self._frame = 0
+        self._time_s = 0.0
+        self._last_stamp_s: float | None = None
+        self._warned_no_box = False
 
-    def _assign_new_id(self, instance: MultiViewInstance) -> None:
+    # ------------------------------------------------------------------ helpers
+    @staticmethod
+    def _box(item: MultiViewInstance):
+        """World AABB of a fused instance (metres) or None."""
+        if item.bbox_min is not None and item.bbox_max is not None:
+            return np.asarray(item.bbox_min, np.float64), np.asarray(item.bbox_max, np.float64)
+        if item.centroid_world is not None:                         # degenerate box at the centroid
+            c = np.asarray(item.centroid_world, np.float64)
+            return c.copy(), c.copy()
+        return None
+
+    @staticmethod
+    def _containment(lo_a, hi_a, lo_b, hi_b) -> float:
+        """Intersection volume over the smaller box volume for two world AABBs (metres)."""
+        inter = np.prod(np.maximum(np.minimum(hi_a, hi_b) - np.maximum(lo_a, lo_b), 0.0))
+        if inter <= 0.0:
+            return 0.0
+        vol = min(np.prod(np.maximum(hi_a - lo_a, 1e-6)), np.prod(np.maximum(hi_b - lo_b, 1e-6)))
+        return float(inter / vol)
+
+    def _affinity(self, track: _Track, lo_o: np.ndarray, hi_o: np.ndarray) -> float:
+        """Containment of the track's last box with the observation; 1.0 when one box contains
+        the other's centre (expanded by centre_margin_m)."""
+        ratio = self._containment(track.bbox_min, track.bbox_max, lo_o, hi_o)
+        g = self.centre_margin_m
+        centre_t = 0.5 * (track.bbox_min + track.bbox_max)
+        centre_o = 0.5 * (lo_o + hi_o)
+        if np.all(centre_t >= lo_o - g) and np.all(centre_t <= hi_o + g):
+            return 1.0
+        if np.all(centre_o >= track.bbox_min - g) and np.all(centre_o <= track.bbox_max + g):
+            return 1.0
+        return ratio
+
+    def _assign_new_id(self, instance: MultiViewInstance, box=None) -> None:
         instance.global_track_id = self.next_global_track_id
         self.next_global_track_id += 1
+        if box is not None:
+            self.tracks[instance.global_track_id] = _Track(
+                track_id=instance.global_track_id, label=instance.semantic_label,
+                bbox_min=box[0].copy(), bbox_max=box[1].copy(), created=self._frame, last_seen_s=self._time_s,
+            )
+
+    def _update_track(self, track: _Track, item: MultiViewInstance, box) -> None:
+        track.bbox_min, track.bbox_max = box[0].copy(), box[1].copy()
+        track.misses = 0
+        track.coast_s = 0.0
+        track.last_seen_s = self._time_s
+        track.hits += 1
+        item.global_track_id = track.track_id
 
     def _stage_current_bank(
         self,
@@ -1368,62 +1527,46 @@ class CrossFrameAligner:
             else:
                 self.workspace.stage_current([item.points_world for item in current])
 
-        # Export zero-copy views of the bank that was already required for
-        # Chamfer. ScenePredictor reuses these views instead of uploading the
-        # same fused cloud a second time.
+        # Export zero-copy views of the bank. ScenePredictor reuses these views instead of
+        # uploading the same fused cloud a second time.
         views, ready_event = self.workspace.current_cloud_views()
         if len(views) != len(current):
             raise RuntimeError(
                 "Cross-frame GPU bank view count does not match current fused "
                 f"instances: {len(views)} != {len(current)}"
             )
-        # Assigning a Tensor slice is metadata-only: no D2D copy, no kernel, no
-        # cross-view GPU fusion. promote_current() only swaps workspace handles;
-        # these Tensor objects continue referencing the uploaded storage.
         for item, view in zip(current, views):
             item.points_world_gpu = view
             item.points_world_gpu_ready_event = ready_event
             if item.fused_member_clouds_gpu is not None:
-                # The concatenated bank row is the fused cloud from here on.
                 item.fused_points_gpu = view
 
+    # ------------------------------------------------------------------ main
     def align(
         self,
         current: list[MultiViewInstance],
         profiler: Any | None = None,
+        stamp_ns: int | None = None,
     ) -> dict[str, int]:
         started = time.perf_counter()
         counters = {
             "num_cross_frame_candidate_pairs": 0,
             "num_cross_frame_matches": 0,
+            "num_cross_frame_new_ids": 0,
+            "num_cross_frame_coasting": 0,
+            "num_cross_frame_dropped": 0,
         }
-        if not current:
-            self.previous = []
-            self.workspace.clear_previous()
-            if profiler is not None:
-                profiler.record(
-                    "cross_frame_total",
-                    1000.0 * (time.perf_counter() - started),
-                )
-            return counters
-
-        # Upload the unique current fused clouds once.  The previous frame was
-        # retained on CUDA by the prior promote_current() call.
-        self._stage_current_bank(current, profiler)
-
-        if not self.previous:
-            for instance in current:
-                self._assign_new_id(instance)
-                self._propagate_id_to_members(instance)
-            self.previous = current
-            if self.workspace.cuda_enabled:
-                self.workspace.promote_current()
-            if profiler is not None:
-                profiler.record(
-                    "cross_frame_total",
-                    1000.0 * (time.perf_counter() - started),
-                )
-            return counters
+        self._frame += 1
+        stamp_s = None if not stamp_ns else stamp_ns * 1e-9
+        if stamp_s is not None and self._last_stamp_s is not None and 0.0 < stamp_s - self._last_stamp_s < 5.0:
+            dt = stamp_s - self._last_stamp_s
+        else:
+            dt = self.nominal_dt_s
+        if stamp_s is not None:
+            self._last_stamp_s = stamp_s
+        self._time_s += dt
+        if current:
+            self._stage_current_bank(current, profiler)
 
         gate_context = (
             profiler.stage("cross_frame_gate", cuda=False)
@@ -1431,97 +1574,62 @@ class CrossFrameAligner:
             else _NullContext()
         )
         with gate_context:
-            current_labels = np.asarray(
-                [item.semantic_label for item in current], dtype=object
-            )
-            previous_labels = np.asarray(
-                [item.semantic_label for item in self.previous], dtype=object
-            )
-            current_centroids = np.stack(
-                [
-                    item.centroid_world
-                    if item.centroid_world is not None
-                    else np.full(3, np.nan, dtype=np.float32)
-                    for item in current
-                ]
-            )
-            previous_centroids = np.stack(
-                [
-                    item.centroid_world
-                    if item.centroid_world is not None
-                    else np.full(3, np.nan, dtype=np.float32)
-                    for item in self.previous
-                ]
-            )
-            same_class = current_labels[:, None] == previous_labels[None, :]
-            delta = current_centroids[:, None, :] - previous_centroids[None, :, :]
-            centroid_distance = np.linalg.norm(delta, axis=2)
-            candidate_mask = (
-                same_class
-                & np.isfinite(centroid_distance)
-                & (centroid_distance <= self.centroid_gate_m)
-            )
-
-        candidate_indices = np.argwhere(candidate_mask)
-        counters["num_cross_frame_candidate_pairs"] = int(len(candidate_indices))
-        cost = np.full(
-            (len(current), len(self.previous)), 1e6, dtype=np.float32
-        )
-
-        if len(candidate_indices):
-            cuda_enabled = self.workspace.cuda_enabled
-            chamfer_context = (
-                profiler.stage("cross_frame_chamfer", cuda=cuda_enabled)
-                if profiler is not None
-                else _NullContext()
-            )
-            with chamfer_context:
-                if cuda_enabled:
-                    chamfer = self.workspace.compute_indices(candidate_indices)
-                else:
-                    candidate_clouds = [
-                        (
-                            current[int(row)].points_world,
-                            self.previous[int(col)].points_world,
-                        )
-                        for row, col in candidate_indices
-                    ]
-                    chamfer = self.workspace.compute_cpu(candidate_clouds)
-            for (row, col), distance in zip(candidate_indices, chamfer):
-                if not math.isfinite(float(distance)):
-                    continue
-                if self.max_chamfer_m is not None and distance > self.max_chamfer_m:
-                    continue
-                cost[int(row), int(col)] = float(distance)
-
-        hungarian_context = (
-            profiler.stage("cross_frame_hungarian", cuda=False)
-            if profiler is not None
-            else _NullContext()
-        )
-        matched_current: set[int] = set()
-        with hungarian_context:
-            if cost.size and np.any(cost < 1e6):
-                rows, cols = linear_sum_assignment(cost)
-                for row, col in zip(rows, cols):
-                    if cost[row, col] >= 1e6:
+            boxes = [self._box(item) for item in current]
+            if any(b is None for b in boxes) and not self._warned_no_box:
+                self._warned_no_box = True
+                logger.warning("cross-frame: fused instance without AABB/centroid; it gets a fresh id every frame")
+            free = set(range(len(current)))
+            matched_tracks: set[int] = set()
+            # Oldest track first ("oldest id wins" when two groups merge into one observation).
+            for track in sorted(self.tracks.values(), key=lambda t: (t.created, t.track_id)):
+                best, best_a = None, self.min_containment_ratio
+                for i in free:
+                    if boxes[i] is None or current[i].semantic_label != track.label:
                         continue
-                    global_id = self.previous[int(col)].global_track_id
-                    if global_id is None:
-                        global_id = self.next_global_track_id
-                        self.next_global_track_id += 1
-                    current[int(row)].global_track_id = int(global_id)
-                    matched_current.add(int(row))
-                    counters["num_cross_frame_matches"] += 1
-
-        for index, instance in enumerate(current):
-            if index not in matched_current:
-                self._assign_new_id(instance)
-            self._propagate_id_to_members(instance)
+                    counters["num_cross_frame_candidate_pairs"] += 1
+                    a = self._affinity(track, *boxes[i])
+                    if a >= best_a:
+                        best, best_a = i, a
+                if best is None:
+                    continue
+                free.discard(best)
+                matched_tracks.add(track.track_id)
+                self._update_track(track, current[best], boxes[best])
+                counters["num_cross_frame_matches"] += 1
+            for i in sorted(free):
+                why = ""
+                if boxes[i] is not None and logger.isEnabledFor(logging.INFO):
+                    same = [t for t in self.tracks.values() if t.label == current[i].semantic_label and t.track_id not in matched_tracks]
+                    if same:
+                        near = max(same, key=lambda t: self._affinity(t, *boxes[i]))
+                        size = np.round(boxes[i][1] - boxes[i][0], 2).tolist()
+                        why = (f"; best unmatched id {near.track_id}: affinity {self._affinity(near, *boxes[i]):.2f} < {self.min_containment_ratio:g}, "
+                               f"unseen {self._time_s - near.last_seen_s:.2f} s, obs box size {size}, dt {dt * 1e3:.0f} ms")
+                self._assign_new_id(current[i], boxes[i])
+                counters["num_cross_frame_new_ids"] += 1
+                centre = None if boxes[i] is None else np.round(0.5 * (boxes[i][0] + boxes[i][1]), 3).tolist()
+                logger.info("cross-frame: new id %d for %s at %s%s", current[i].global_track_id, current[i].semantic_label, centre, why)
+            for track_id in list(self.tracks):
+                track = self.tracks[track_id]
+                if track_id in matched_tracks or track.created == self._frame:
+                    continue
+                track.misses += 1
+                track.coast_s = self._time_s - track.last_seen_s
+                if track.coast_s > self.max_age_s:
+                    del self.tracks[track_id]
+                    counters["num_cross_frame_dropped"] += 1
+                    logger.info("cross-frame: id %d (%s) dropped after %.2f s / %d frames unobserved", track_id, track.label,
+                                track.coast_s, track.misses)
+                    continue
+                counters["num_cross_frame_coasting"] += 1
+            for instance in current:
+                self._propagate_id_to_members(instance)
 
         self.previous = current
-        if self.workspace.cuda_enabled:
+        if current and self.workspace.cuda_enabled:
             self.workspace.promote_current()
+        elif not current:
+            self.workspace.clear_previous()
         if profiler is not None:
             profiler.record(
                 "cross_frame_total",

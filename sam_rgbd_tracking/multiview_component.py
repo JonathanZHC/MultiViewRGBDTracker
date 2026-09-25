@@ -149,8 +149,9 @@ class MultiViewEfficientTAMComponent:
             groups, cross_view_counts = self.cross_view.align(
                 results, profiler=self.profiler
             )
+            stamp_ns = max((int(getattr(r.frame, "timestamp_ns", 0) or 0) for r in results), default=0)
             cross_frame_counts = self.cross_frame.align(
-                groups, profiler=self.profiler
+                groups, profiler=self.profiler, stamp_ns=stamp_ns or None
             )
         self.last_multiview_instances = groups
         counters = {**cross_view_counts, **cross_frame_counts}
