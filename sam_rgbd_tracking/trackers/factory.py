@@ -50,5 +50,7 @@ def build_multiview_efficient_tam_tracker(config, *, num_views: int):
         slot_layout_key=slot_layout_key(config),
         feature_history_frames=int(cfg.get("feature_history_frames", 32)),
         use_max_autotune=bool(cfg.get("use_max_autotune", False)),
+        memory_attention_cuda_graphs=bool(cfg.get("memory_attention_cuda_graphs", False)),
+        skip_inactive_slots=bool(cfg.get("skip_inactive_slots", False)),
         **_common_tracker_kwargs(config),
     )

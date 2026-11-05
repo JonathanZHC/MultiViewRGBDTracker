@@ -56,6 +56,8 @@ class Sam3Detector:
         if torch is None:
             raise RuntimeError("PyTorch is required for SAM3")
         self.checkpoint = str(config.detector.checkpoint)
+        # Set by AsyncSAM3Worker for cooperative scheduling: called between post-processing rows.
+        self.yield_point = None
         self.device = str(config.runtime.device)
         self.use_bf16 = bool(config.runtime.get("use_bf16", True))
         self.capacities = class_capacities(config)
@@ -310,6 +312,8 @@ class Sam3Detector:
                 rgb = rgbs[view_idx]
                 if not keep_all_cpu[pair_index].any():
                     continue
+                if self.yield_point is not None:
+                    self.yield_point()           # cooperative scheduling (async_sam3.py): one row at a time
                 keep = keep_all[pair_index]
 
                 if True:

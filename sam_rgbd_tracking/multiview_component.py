@@ -342,7 +342,9 @@ class MultiViewEfficientTAMComponent:
 
         if correction is not None:
             reference_idx = int(correction.frame_index)
-            self.profiler.record("sam3_async", float(correction.wall_ms))
+            self.profiler.record("sam3_async", float(correction.wall_ms))   # includes cooperative waits
+            if getattr(correction, "yield_wait_ms", 0.0):
+                self.profiler.record("sam3_yield_wait", float(correction.yield_wait_ms))
             self.profiler.record("sam3_filter", float(correction.filter_cpu_ms))
             if reference_idx >= current_frame_idx:
                 correction_drop_reason = "reference_not_older_than_current"

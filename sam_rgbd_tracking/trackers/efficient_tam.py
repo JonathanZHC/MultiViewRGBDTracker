@@ -73,6 +73,42 @@ def _disable_unavailable_hole_fill_extension(predictor: Any) -> None:
     )
 
 
+def _recompile_memory_attention_with_cuda_graphs(predictor: Any, max_autotune: bool) -> None:
+    """Recompile memory_attention with CUDA graphs ("max-autotune" with use_max_autotune, else "reduce-overhead").
+
+    Upstream compiles it with mode="default" (no CUDA graphs) because the number of memories varies. The shapes are
+    still static per memory length (dynamic=False), a small finite set (1 conditioning + up to 6 recent frames, up
+    to 16 object pointers), so one recorded graph per length removes its ~100 Python kernel launches per frame
+    (real2 replay: tracker step 7.1 -> 6.0 ms). The output clone boundary installed next keeps it graph-safe.
+    """
+    if torch is None:
+        raise RuntimeError("PyTorch is required for EfficientTAM")
+    module = getattr(predictor, "memory_attention", None)
+    if module is None:
+        raise RuntimeError("EfficientTAM predictor has no memory_attention module")
+    original = getattr(module.forward, "_torchdynamo_orig_callable", None)
+    if original is None:
+        raise RuntimeError("EfficientTAM memory_attention.forward is not a torch.compile wrapper")
+    import torch._dynamo as dynamo
+
+    # One specialization per memory length (about 16) and batch size (skip_inactive_slots: one per bucket, up to 5):
+    # far above Dynamo's default recompile limit of 8.
+    for name in ("recompile_limit", "cache_size_limit"):
+        if hasattr(dynamo.config, name):
+            setattr(dynamo.config, name, max(int(getattr(dynamo.config, name)), 256))
+    module.forward = torch.compile(
+        original,
+        mode="max-autotune" if max_autotune else "reduce-overhead",
+        fullgraph=True,
+        dynamic=False,
+    )
+    print(
+        "[EfficientTAM] memory_attention compiled with CUDA graphs "
+        f"({'max-autotune' if max_autotune else 'reduce-overhead'})",
+        flush=True,
+    )
+
+
 def _install_memory_attention_clone_boundary(predictor: Any) -> None:
     """Keep CUDAGraph enabled and clone only memory-attention output."""
     if torch is None:
@@ -163,6 +199,8 @@ class EfficientTAMTracker(Sam2StyleStreamingTracker):
         slot_layout_key: tuple[str, ...] | list[str] = (),
         feature_history_frames: int = 32,
         use_max_autotune: bool = False,
+        memory_attention_cuda_graphs: bool = False,
+        skip_inactive_slots: bool = False,
         **kwargs: Any,
     ) -> None:
         self.execution_mode = str(execution_mode).strip().lower()
@@ -176,6 +214,8 @@ class EfficientTAMTracker(Sam2StyleStreamingTracker):
         self.slot_layout_key = tuple(str(value) for value in slot_layout_key)
         self.feature_history_frames = max(2, int(feature_history_frames))
         self.use_max_autotune = bool(use_max_autotune)
+        self.memory_attention_cuda_graphs = bool(memory_attention_cuda_graphs)
+        self.skip_inactive_slots = bool(skip_inactive_slots) and self.execution_mode == "fixed_batch"
         self.prewarm_enabled = bool(prewarm_enabled)
         cleaned = sorted({max(1, int(value)) for value in prewarm_object_counts})
         self.prewarm_object_counts = tuple(cleaned or [1])
@@ -203,6 +243,7 @@ class EfficientTAMTracker(Sam2StyleStreamingTracker):
             *self.slot_layout_key,
             str(self.feature_history_frames),
             str(self.use_max_autotune),
+            str(self.memory_attention_cuda_graphs),
         )
 
     def _build_predictor(self) -> Any:
@@ -225,8 +266,16 @@ class EfficientTAMTracker(Sam2StyleStreamingTracker):
 
         _move_rope_frequency_caches_to_device(predictor, self.device)
         _disable_unavailable_hole_fill_extension(predictor)
+        if self.skip_inactive_slots:
+            # Only slots holding an object at the last seed / SAM3 correction are propagated in between
+            # (EfficientTAM fork: _propagate_fixed_active_step).
+            predictor.fixed_batch_skip_inactive = True
 
+        if self.memory_attention_cuda_graphs and not self.vos_optimized:
+            print("[EfficientTAM] memory_attention_cuda_graphs needs vos_optimized: true; ignored", flush=True)
         if self.vos_optimized:
+            if self.memory_attention_cuda_graphs:
+                _recompile_memory_attention_with_cuda_graphs(predictor, self.use_max_autotune)
             _install_memory_attention_clone_boundary(predictor)
         return predictor
 
@@ -557,9 +606,25 @@ class EfficientTAMMultiViewTracker(EfficientTAMTracker):
                 f"expected_ids={self.track_ids_per_view}, actual_ids={actual_ids}"
             )
 
+    def _set_active_slots(self, states: list[dict[str, Any]], masks_per_view: list[list[Any]]) -> None:
+        """Active slots = slots whose seed / correction mask is non-empty (fixed_batch skip_inactive_slots)."""
+        if not self.skip_inactive_slots:
+            return
+
+        def nonempty(mask: Any) -> bool:
+            if torch is not None and torch.is_tensor(mask):
+                return bool(mask.any())
+            return bool(np.asarray(mask).any())
+
+        self.predictor.set_fixed_batch_active_slots(
+            states,
+            [[i for i, mask in enumerate(masks) if nonempty(mask)] for masks in masks_per_view],
+        )
+
     @staticmethod
     def _clear_multiview_tags(state: dict[str, Any]) -> None:
         for key in (
+            "fixed_batch_active_slots",
             "fixed_batch_real_obj_ids",
             "fixed_batch_real_obj_count",
             "fixed_batch_dummy_obj_ids",
@@ -840,6 +905,7 @@ class EfficientTAMMultiViewTracker(EfficientTAMTracker):
 
                 self._prepare_live_states(states)
                 self._assert_prepared_states(states)
+                self._set_active_slots(states, [[seed.mask for seed in seeds] for seeds in seeds_per_view])
                 self._live_prepared = True
                 snapshot = self.predictor.snapshot_multiview_image_features(
                     states,
@@ -909,6 +975,8 @@ class EfficientTAMMultiViewTracker(EfficientTAMTracker):
                             f"Direct correction requires reference < current, got "
                             f"{reference_idx} -> {frame_idx}"
                         )
+                    # The new object set: only these slots are corrected and then propagated (skip_inactive_slots).
+                    self._set_active_slots(states, correction_masks_per_view)
                     results = self.predictor.correct_multiview_from_reference(
                         states,
                         reference_feature_snapshot=reference_snapshot,
@@ -964,6 +1032,7 @@ class EfficientTAMMultiViewTracker(EfficientTAMTracker):
             id(self.predictor),
             "multiview",
             self.execution_mode,
+            self.skip_inactive_slots,
             self.num_views,
             self.object_slots_per_view,
             tuple(rgbs[0].shape),
@@ -1050,6 +1119,76 @@ class EfficientTAMMultiViewTracker(EfficientTAMTracker):
                         finally:
                             for stream in temp_streams:
                                 stream.close()
+
+                        # Active-slot propagation (skip_inactive_slots): the smaller padded batch sizes, each
+                        # through the growing memory lengths, so no live frame compiles or records a graph.
+                        if self.skip_inactive_slots:
+                            for bucket in self.predictor.fixed_batch_buckets()[:-1]:
+                                bucket_streams = [
+                                    self._new_stream_from_rgb(rgb, buffer_frames=buffer_frames)
+                                    for rgb in rgbs
+                                ]
+                                try:
+                                    states = [stream.state for stream in bucket_streams]
+                                    bucket_masks: list[list[np.ndarray]] = []
+                                    for view_idx, state in enumerate(states):
+                                        masks = _synthetic_masks(
+                                            rgbs[view_idx].shape[0],
+                                            rgbs[view_idx].shape[1],
+                                            self.object_slots_per_view,
+                                        )
+                                        bucket_masks.append(masks)
+                                        for obj_idx, mask in enumerate(masks, start=1):
+                                            self.predictor.add_new_mask(
+                                                inference_state=state, frame_idx=0, obj_id=obj_idx, mask=mask
+                                            )
+                                    self.predictor.prepare_multiview_states(states, conditioning_frame_idx=0)
+                                    slots = [
+                                        (view_idx, obj_idx)
+                                        for view_idx in range(self.num_views)
+                                        for obj_idx in range(self.object_slots_per_view)
+                                    ][:bucket]
+                                    self.predictor.set_fixed_batch_active_slots(
+                                        states,
+                                        [[o for v, o in slots if v == view_idx] for view_idx in range(self.num_views)],
+                                    )
+                                    for frame_idx in range(1, temporal_frames + 1):
+                                        for view_idx, stream in enumerate(bucket_streams):
+                                            stream.append(self._variant_rgb(rgbs[view_idx], frame_idx + 57 * view_idx))
+                                        snapshot = self.predictor.snapshot_multiview_image_features(
+                                            states, frame_idx=frame_idx
+                                        )
+                                        self.predictor.propagate_multiview_step(
+                                            states, frame_idx=frame_idx, reverse=False, image_feature_snapshot=snapshot
+                                        )
+                                    # A correction of this many slots (reference + current track_step) and
+                                    # the propagation right after it.
+                                    reference_snapshot = snapshot
+                                    for step in (1, 2):
+                                        frame_idx = temporal_frames + step
+                                        for view_idx, stream in enumerate(bucket_streams):
+                                            stream.append(self._variant_rgb(rgbs[view_idx], frame_idx + 57 * view_idx))
+                                        snapshot = self.predictor.snapshot_multiview_image_features(
+                                            states, frame_idx=frame_idx
+                                        )
+                                        if step == 1:
+                                            self.predictor.correct_multiview_from_reference(
+                                                states,
+                                                reference_feature_snapshot=reference_snapshot,
+                                                reference_masks=bucket_masks,
+                                                current_frame_idx=frame_idx,
+                                                current_feature_snapshot=snapshot,
+                                                reverse=False,
+                                            )
+                                        else:
+                                            self.predictor.propagate_multiview_step(
+                                                states, frame_idx=frame_idx, reverse=False, image_feature_snapshot=snapshot
+                                            )
+                                    if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+                                        torch.cuda.synchronize(torch.device(self.device))
+                                finally:
+                                    for stream in bucket_streams:
+                                        stream.close()
 
                         # Direct-correction path: corrected reference x -> current t,
                         # followed by one ordinary propagation. This keeps the first
