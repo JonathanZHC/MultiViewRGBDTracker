@@ -12,8 +12,8 @@ This repository keeps the complete benchmark stack together:
 - SAM3 image segmentation on sparse keyframes;
 - EfficientTAM fixed-batch multi-view / multi-instance tracking;
 - batched RGB-D mask/depth post-processing and per-instance point clouds;
-- cross-view sparse-voxel matching and fusion;
-- cross-frame centroid gate + batched GPU Chamfer + Hungarian assignment;
+- cross-view association by surface gap under the per-class instance count, and fusion;
+- cross-frame persistent ids by the nearest world box;
 - cycle-time profiling with warmup exclusion;
 - RViz visualization.
 
@@ -249,15 +249,11 @@ batched mask / connected-component / RGB-D post-processing
         ↓
 per-view instance point clouds in world coordinates
         ↓
-cross-view semantic gate + sparse voxel matching + Hungarian
+cross-view: per class, surface gap + instance count → one-to-one matching (Hungarian)
         ↓
 fused / unmatched-preserved MultiViewInstance objects
         ↓
-cross-frame semantic+centroid gate
-        ↓
-batched GPU bidirectional Chamfer
-        ↓
-Hungarian assignment + persistent global IDs
+cross-frame: per class, box gate → nearest-centre assignment (Hungarian) → persistent global IDs
         ↓
 ROS / RViz / downstream consumer
 ```
@@ -282,78 +278,27 @@ The capacities define the fixed EfficientTAM slot layout for every view. Inactiv
 
 ### Cross-view
 
-Cross-view matching first compares only the same semantic class, then uses sparse shared-world voxel geometry, bbox rejection, bidirectional neighborhood coverage, and Hungarian assignment.
+Cross-view matching compares only observations of the same semantic class (`sam_rgbd_tracking/cross_view_gap.py`, called from `alignment.py`).
 
 A failed cross-view match **does not discard an observation**. Each unmatched local observation remains a valid single-view `MultiViewInstance`. This is important for occlusion and asymmetric camera visibility.
 
-`shared_voxel_grid.association` selects the test (`sam_rgbd_tracking/alignment.py`, `cross_view_gap.py`):
-
-| `association` | Two observations are the same object when | Fails |
-| --- | --- | --- |
-| `gap` | their surface gap is small, or the per-class instance count leaves no other choice | objects of a class that touch and are each seen by another camera only |
-| `containment` | the intersection of their world boxes fills half of the smaller box | small objects seen from two sides; partial views that do not overlap |
-| `coverage` (legacy) | their voxel surfaces cover each other | views without common surface |
-
-`gap` in three steps, per semantic class:
+Per semantic class, in three steps:
 
 1. **Gap.** For every pair of observations of different cameras: the distance within which 5 % of one cloud's voxels find the other cloud (the smaller of the two directions). Two views of one object give 1 - 3 cm (up to 12 cm for cameras opposite each other, which share only the eroded silhouette rim), whatever the size of the object and also when the boxes do not overlap; two objects give their distance. Boxes farther apart than `gap.split_m` are not measured.
 2. **Assignment under the count.** Per pair of cameras the observations are matched one to one with the least total gap (Hungarian); the matches of all camera pairs are united smallest gap first, at most one observation per camera in a group. A gap below `gap.merge_m` merges on its own. A class has at most as many instances as its prompt capacity: if more groups are left, the threshold is raised just far enough for the count to fit, up to `gap.forced_max_m`, and forced merges that the count does not need are undone. A count that cannot be reached is left (`num_cross_view_over_capacity`); nothing is dropped.
 3. **Time.** A pair is known by its two per-camera slots. A merged pair stays merged up to `gap.split_m`; a merge forced by the count outlives the count by `gap.memory_s`. Nothing is smoothed: when a slot jumps to another object the grouping follows in the same frame. A known pair is measured again every `gap.measure_every` frames, or at once when its boxes moved against each other by half of what its gap is away from a change of state.
 
-`scripts/benchmark_association.py` runs both stages against known identities on 20 synthetic scenes (persons, cans, balls, boxes, sticks, pipes, furniture, a door; 2 - 4 cameras; occluders, objects entering and leaving, a false positive, a lost detection, a slot jump, calibration error, flying pixels); `--turn`, `--seed` and `--spare` give variants, `--gpu` the deployed device-resident path. `scripts/test_association.py` holds the unit tests.
+`scripts/benchmark_association.py` runs both stages against known identities on 20 synthetic scenes (persons, cans, balls, boxes, sticks, pipes, furniture, a door; 2 - 4 cameras; occluders, objects entering and leaving, a false positive, a lost detection, a slot jump, calibration error, flying pixels); `--turn`, `--seed` and `--spare` give variants, `--gpu` the deployed device-resident path. `scripts/test_association.py` holds the unit tests. Every cross-view pair is right in 100 % of the frames; the cross-view step takes 0.05 - 0.4 ms with two cameras. The world-box containment test and the voxel-coverage test used before were removed (containment: 59 % on the same scenes - small objects seen from two sides give two shells whose boxes overlap by 10 - 20 %); a config that still names them is refused.
+
+Known limits: two objects of a class that touch and are each seen by another camera only are merged; without a count that forces it, two parts of an object more than `gap.merge_m` apart stay two instances.
 
 ### Cross-frame
 
-A track is its last observed world box; a track and an observation of its class can be matched when the containment of the boxes reaches `min_containment_ratio` or one box holds the other's centre (expanded by `centre_margin_m`). `cross_frame_alignment.assignment` decides who is matched with whom: `nearest` takes as many matches as possible with the least total distance between the box centres (the older track wins a tie), `oldest_first` lets the oldest track take the observation with the highest affinity first. Objects of a class closer than `centre_margin_m` have affinity 1 for each other, so `oldest_first` exchanges their ids at random. With `nearest` the margin is the one after a frame at 30 Hz and grows with the time since the track was seen (a speed limit of `centre_margin_m / nominal_dt_s`, 4.5 m/s), so a lower frame rate or a short occlusion does not cost the id. There is no motion model beyond that.
+A track is its last observed world box; there is no motion model. A track and an observation of its class can be matched when the containment of their boxes (intersection volume over the smaller box) reaches `min_containment_ratio` or one box holds the other's centre, expanded by a margin. The margin is `centre_margin_m` after one frame at 30 Hz and grows with the time since the track was seen (a speed limit of `centre_margin_m / nominal_dt_s`, 4.5 m/s), so a lower frame rate or a short occlusion does not cost the id. Among the possible matches the aligner takes as many as possible with the least total distance between the box centres (Hungarian); of two tracks at the same distance the older one wins, so the survivor keeps the oldest id when two groups merge, and objects of a class next to each other keep their ids. Unmatched tracks keep their id for `max_age_s`; unmatched observations start a new track. An object that reappears farther away than the margin allows gets a new id.
 
-Earlier description (Chamfer matching, retired; the CUDA bank of fused clouds is still staged here):
+### Cloud bank
 
-
-Cross-frame matching is performed every frame:
-
-```text
-same class + centroid-distance gate
-        ↓
-batched GPU bidirectional Chamfer
-        ↓
-Hungarian assignment
-```
-
-The fused point cloud is voxel-deduplicated before Chamfer to remove repeated samples from overlapping camera views.
-
-### Automatic Chamfer pair-workspace capacity
-
-There is no `chamfer_preallocate_pairs` hyperparameter.
-
-Let:
-
-- `V` = actual runtime number of camera views;
-- `K_c` = per-view configured instance capacity for semantic class `c`.
-
-Because cross-view matching intentionally keeps unmatched observations, one class can contribute at most `V * K_c` `MultiViewInstance` objects to cross-frame alignment in the worst case. Both the current and previous frame may reach that number. Since Chamfer is only evaluated for the same semantic class, the strict candidate-pair upper bound is:
-
-```text
-max_cross_frame_pairs = sum_c (V * K_c)^2
-```
-
-Examples:
-
-```text
-2 cameras, capacities [1, 1, 1]
-→ 2² + 2² + 2² = 12 pairs
-
-2 cameras, capacities [3, 2, 1]
-→ 6² + 4² + 2² = 56 pairs
-
-1 camera, capacities [3, 2, 1]
-→ 3² + 2² + 1² = 14 pairs
-```
-
-This value is computed once at initialization and used as the exact fixed pair dimension of the reusable Chamfer workspace. It is **not rounded** and does not change the number of candidate pairs actually evaluated on a frame; the semantic and centroid gates still determine the real per-frame candidate count.
-
-If runtime ever exceeds this strict bound, the tracker raises an error because that indicates either an incorrect configured capacity or unexpected duplicate cross-view observations.
-
-The point dimension is different: `chamfer_preallocate_points` is only a startup hint and may grow geometrically when a larger fused point cloud appears.
+The fused clouds of the current and of the previous frame live in a CUDA bank (`_CloudBank` in `alignment.py`) with one row per fused instance. Because cross-view matching keeps unmatched observations, there are at most `V * sum_c K_c` rows (`V` cameras, `K_c` the per-view capacity of class `c`); more than that raises an error, because it means a wrong capacity or duplicate observations. `cross_frame_alignment.bank_preallocate_points` is the row length allocated at start; the bank grows geometrically when a larger cloud appears. In GPU-alignment mode the clouds are copied device to device; an in-process consumer (ScenePredictor) reads the rows as zero-copy views, and the two banks swap at frame end so that the previous frame's views stay valid.
 
 ## 8. Batched post-processing
 
@@ -432,8 +377,8 @@ postprocess_geometry
 postprocess_finalize
 alignment_total
 cross_view_total
+cross_view_match
 cross_frame_total
-cross_frame_chamfer
 ```
 
 ### Warmup exclusion
@@ -557,17 +502,15 @@ postprocess:
   build_owner_map: false
 
 shared_voxel_grid:
-  voxel_size_m: 0.01
+  voxel_size_m: 0.005
   origin_world: [0.0, 0.0, 0.0]
-  match_radius_voxels: 1
-  min_alignment_score: 0.15
-  min_bidirectional_coverage: 0.10
-  max_local_dense_voxels: 4000000
+  gap: {merge_m: 0.15, split_m: 0.20, forced_max_m: 0.50}
 
 cross_frame_alignment:
-  centroid_gate_m: 0.20
-  chamfer_max_workspace_mb: 512
-  chamfer_preallocate_points: 8192
+  min_containment_ratio: 0.5
+  centre_margin_m: 0.15
+  max_age_s: 0.5
+  bank_preallocate_points: 8192
 
 profiling:
   enabled: true
@@ -580,7 +523,7 @@ Important configuration rules in dependency mode:
 - `runtime.target_hz` should match the effective rate at which the parent application calls the tracker. It is used to convert `detector.refresh_seconds` into logical frames.
 - `runtime.camera_names` defines the default view order. The constructor can override it with `camera_names=[...]`.
 - `detector.prompts` is both the semantic prompt list and the **fixed per-view slot-capacity definition**. Changing capacities changes the fixed EfficientTAM batch shape; reconstruct the component after changing them.
-- `chamfer_preallocate_pairs` does not exist. The strict pair-workspace bound is derived automatically from the runtime view count and the configured per-class capacities as described in Section 7.
+- `detector.prompts` capacities are also the per-class instance counts of the cross-view association: a class never needs more fused instances than its capacity, which is what lets two views of one object merge when their gap alone would not decide it.
 - `ros:` is only required by the ROS/visualization adapters, not by `MultiViewEfficientTAMComponent` itself.
 
 ### 11.3 Input interface
@@ -877,11 +820,10 @@ voxel representative selection, and CPU alignment receives only compact voxel
 data on normal frames. Full CPU masks are materialized only for visualization,
 debug output, or the SAM3 refresh frame that needs them.
 
-Cross-view matching/fusion and Hungarian assignment remain on CPU. Cross-frame
-Chamfer uses a persistent CUDA cloud bank; the same already-uploaded bank is
-exported as a zero-copy view for an in-process ScenePredictor consumer. The
-failed GPU cross-view-fusion/alignment experiments are not part of the frozen
-implementation.
+Cross-view matching and both Hungarian assignments run on the CPU, on the voxel
+indices that come back with the geometry metadata. The fused clouds stay in a
+persistent CUDA cloud bank, which is exported as a zero-copy view for an
+in-process ScenePredictor consumer.
 
 The former independent experimental switches for direct geometry, compact D2H, depth
 prefetch, lazy masks, and GPU-bank reuse were removed. `gpu_geometry: false` is

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-view gap association and the cross-frame nearest assignment (CPU). Run: python -m pytest scripts/test_association.py"""
+"""Cross-view gap association and cross-frame ids (CPU). Run: python -m pytest scripts/test_association.py"""
 from __future__ import annotations
 
 import sys
@@ -178,11 +178,11 @@ def test_more_instances_than_the_capacity_are_left_when_nothing_is_near():
 
 
 # ---- cross-frame ------------------------------------------------------------------------------------------------------
-def _frame_aligner(assignment):
+def _frame_aligner():
     return CrossFrameAligner(Config({
         "runtime": {"device": "cpu", "enable_visualization": False, "camera_names": ["cam0"]},
         "detector": {"prompts": [["can", 3]]},
-        "cross_frame_alignment": {"assignment": assignment, "chamfer_max_workspace_mb": 8},
+        "cross_frame_alignment": {},
     }), num_views=1)
 
 
@@ -192,10 +192,10 @@ def _fused(centres, size=0.07):
             for k, c in enumerate(centres)]
 
 
-def test_objects_next_to_each_other_keep_their_ids_with_the_nearest_assignment():
+def test_objects_next_to_each_other_keep_their_ids():
     rng = np.random.default_rng(0)
     centres = np.array([[0.0, 0.0, 0.8], [0.12, 0.0, 0.8], [0.24, 0.0, 0.8]])
-    aligner = _frame_aligner("nearest")
+    aligner = _frame_aligner()
     first = _fused(centres)
     aligner.align(first, stamp_ns=1)
     ids = [item.global_track_id for item in first]
@@ -207,15 +207,16 @@ def test_objects_next_to_each_other_keep_their_ids_with_the_nearest_assignment()
 
 
 def test_the_margin_grows_with_the_time_since_the_track_was_seen():
-    step = 0.25                                                  # m between sightings: a ball at 5 m/s seen at 20 Hz
-    for assignment, kept in (("nearest", True), ("oldest_first", False)):
-        aligner = _frame_aligner(assignment)
-        first = _fused([[0.0, 0.0, 1.0]], size=0.12)
-        aligner.align(first, stamp_ns=1)
-        second = _fused([[step, 0.0, 1.0]], size=0.12)
-        aligner.align(second, stamp_ns=1 + 50_000_000)
-        assert (second[0].global_track_id == first[0].global_track_id) is kept
-    aligner = _frame_aligner("nearest")                          # hidden for 0.2 s, 0.5 m further on
+    aligner = _frame_aligner()                                   # a ball at 5 m/s seen at 20 Hz: 0.25 m between sightings
+    first = _fused([[0.0, 0.0, 1.0]], size=0.12)
+    aligner.align(first, stamp_ns=1)
+    second = _fused([[0.25, 0.0, 1.0]], size=0.12)
+    aligner.align(second, stamp_ns=1 + 50_000_000)
+    assert second[0].global_track_id == first[0].global_track_id
+    third = _fused([[0.25 + 0.30, 0.0, 1.0]], size=0.12)         # 0.30 m in one frame at 30 Hz is 9 m/s: a new object
+    aligner.align(third, stamp_ns=1 + 50_000_000 + 33_333_333)
+    assert third[0].global_track_id != first[0].global_track_id
+    aligner = _frame_aligner()                                   # hidden for 0.2 s, 0.5 m further on
     first = _fused([[0.0, 0.0, 1.0]], size=0.12)
     aligner.align(first, stamp_ns=1)
     for frame in range(1, 6):
@@ -226,13 +227,22 @@ def test_the_margin_grows_with_the_time_since_the_track_was_seen():
 
 
 def test_the_older_track_keeps_its_id_when_two_instances_become_one():
-    aligner = _frame_aligner("nearest")
+    aligner = _frame_aligner()
     aligner.align(_fused([[0.0, 0.0, 0.8]]), stamp_ns=1)
     two = _fused([[0.0, 0.0, 0.8], [0.06, 0.0, 0.8]])
     aligner.align(two, stamp_ns=33_333_334)
     one = _fused([[0.03, 0.0, 0.8]], size=0.13)
     aligner.align(one, stamp_ns=66_666_667)
     assert one[0].global_track_id == two[0].global_track_id == 1
+
+
+def test_removed_options_are_refused():
+    from sam_rgbd_tracking.alignment import SharedWorldVoxelizer
+    with pytest.raises(ValueError, match="removed"):
+        SharedWorldVoxelizer(Config({"shared_voxel_grid": {"association": "containment"}}))
+    with pytest.raises(ValueError, match="removed"):
+        CrossFrameAligner(Config({"runtime": {"device": "cpu", "camera_names": ["cam0"]}, "detector": {"prompts": [["can", 1]]},
+                                  "cross_frame_alignment": {"assignment": "oldest_first"}}), num_views=1)
 
 
 if __name__ == "__main__":

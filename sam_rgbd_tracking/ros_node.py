@@ -93,14 +93,10 @@ class _RateDiagnostics:
         "postprocess_finalize",
         "alignment_total",
         "cross_view_voxelize",
-        "cross_view_bbox_gate",
-        "cross_view_voxel_match",
-        "cross_view_hungarian",
+        "cross_view_match",
         "cross_view_fusion",
         "cross_view_total",
         "cross_frame_gate",
-        "cross_frame_chamfer",
-        "cross_frame_hungarian",
         "cross_frame_total",
     )
 
@@ -785,9 +781,7 @@ class _RateDiagnostics:
             pipeline_samples,
             (
                 "cross_view_voxelize",
-                "cross_view_bbox_gate",
-                "cross_view_voxel_match",
-                "cross_view_hungarian",
+                "cross_view_match",
                 "cross_view_fusion",
                 "cross_view_total",
             ),
@@ -798,8 +792,6 @@ class _RateDiagnostics:
             pipeline_samples,
             (
                 "cross_frame_gate",
-                "cross_frame_chamfer",
-                "cross_frame_hungarian",
                 "cross_frame_total",
             ),
         )
