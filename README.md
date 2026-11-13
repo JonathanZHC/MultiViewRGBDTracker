@@ -286,7 +286,28 @@ Cross-view matching first compares only the same semantic class, then uses spars
 
 A failed cross-view match **does not discard an observation**. Each unmatched local observation remains a valid single-view `MultiViewInstance`. This is important for occlusion and asymmetric camera visibility.
 
+`shared_voxel_grid.association` selects the test (`sam_rgbd_tracking/alignment.py`, `cross_view_gap.py`):
+
+| `association` | Two observations are the same object when | Fails |
+| --- | --- | --- |
+| `gap` | their surface gap is small, or the per-class instance count leaves no other choice | objects of a class that touch and are each seen by another camera only |
+| `containment` | the intersection of their world boxes fills half of the smaller box | small objects seen from two sides; partial views that do not overlap |
+| `coverage` (legacy) | their voxel surfaces cover each other | views without common surface |
+
+`gap` in three steps, per semantic class:
+
+1. **Gap.** For every pair of observations of different cameras: the distance within which 5 % of one cloud's voxels find the other cloud (the smaller of the two directions). Two views of one object give 1 - 3 cm (up to 12 cm for cameras opposite each other, which share only the eroded silhouette rim), whatever the size of the object and also when the boxes do not overlap; two objects give their distance. Boxes farther apart than `gap.split_m` are not measured.
+2. **Assignment under the count.** Per pair of cameras the observations are matched one to one with the least total gap (Hungarian); the matches of all camera pairs are united smallest gap first, at most one observation per camera in a group. A gap below `gap.merge_m` merges on its own. A class has at most as many instances as its prompt capacity: if more groups are left, the threshold is raised just far enough for the count to fit, up to `gap.forced_max_m`, and forced merges that the count does not need are undone. A count that cannot be reached is left (`num_cross_view_over_capacity`); nothing is dropped.
+3. **Time.** A pair is known by its two per-camera slots. A merged pair stays merged up to `gap.split_m`; a merge forced by the count outlives the count by `gap.memory_s`. Nothing is smoothed: when a slot jumps to another object the grouping follows in the same frame. A known pair is measured again every `gap.measure_every` frames, or at once when its boxes moved against each other by half of what its gap is away from a change of state.
+
+`scripts/benchmark_association.py` runs both stages against known identities on 20 synthetic scenes (persons, cans, balls, boxes, sticks, pipes, furniture, a door; 2 - 4 cameras; occluders, objects entering and leaving, a false positive, a lost detection, a slot jump, calibration error, flying pixels); `--turn`, `--seed` and `--spare` give variants, `--gpu` the deployed device-resident path. `scripts/test_association.py` holds the unit tests.
+
 ### Cross-frame
+
+A track is its last observed world box; a track and an observation of its class can be matched when the containment of the boxes reaches `min_containment_ratio` or one box holds the other's centre (expanded by `centre_margin_m`). `cross_frame_alignment.assignment` decides who is matched with whom: `nearest` takes as many matches as possible with the least total distance between the box centres (the older track wins a tie), `oldest_first` lets the oldest track take the observation with the highest affinity first. Objects of a class closer than `centre_margin_m` have affinity 1 for each other, so `oldest_first` exchanges their ids at random. With `nearest` the margin is the one after a frame at 30 Hz and grows with the time since the track was seen (a speed limit of `centre_margin_m / nominal_dt_s`, 4.5 m/s), so a lower frame rate or a short occlusion does not cost the id. There is no motion model beyond that.
+
+Earlier description (Chamfer matching, retired; the CUDA bank of fused clouds is still staged here):
+
 
 Cross-frame matching is performed every frame:
 

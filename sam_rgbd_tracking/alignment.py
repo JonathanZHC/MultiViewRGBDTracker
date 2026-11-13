@@ -11,8 +11,9 @@ import numpy as np
 from scipy.ndimage import maximum_filter
 from scipy.optimize import linear_sum_assignment
 
+from .cross_view_gap import GapAssociation, GapSettings
 from .data_types import FrameResult, MultiViewInstance, ProcessedInstance
-from .slots import max_cross_frame_candidate_pairs, max_cross_frame_instances
+from .slots import max_cross_frame_candidate_pairs, max_cross_frame_instances, tracked_prompt_capacities
 
 try:
     import torch
@@ -101,9 +102,12 @@ class SharedWorldVoxelizer:
         # from the back by the other: the boxes coincide, the surfaces are a body depth apart)
         # and when one camera sees only part of the object (its box lies inside the other).
         # "coverage": legacy bidirectional voxel-surface coverage on the shared 5 mm lattice.
+        # "gap": surface gap of the two clouds under the per-class instance count (cross_view_gap.py); boxes that
+        # do not overlap but lie next to each other (each camera sees another part of the object) still merge.
         self.association = str(cfg.get("association", "containment"))
-        if self.association not in ("containment", "coverage"):
-            raise ValueError("shared_voxel_grid.association must be 'containment' or 'coverage'")
+        if self.association not in ("containment", "coverage", "gap"):
+            raise ValueError("shared_voxel_grid.association must be 'containment', 'coverage' or 'gap'")
+        self.gap_settings = GapSettings.from_config(cfg.get("gap")) if self.association == "gap" else None
         self.min_containment_ratio = float(cfg.get("min_containment_ratio", 0.5))
         # Temporal hysteresis of a cross-view pairing, keyed by the per-camera slots (EfficientTAM
         # keeps a slot on the same object over time): merge after this many consecutive passing
@@ -452,6 +456,15 @@ class CrossViewAligner:
         # containment association (see SharedWorldVoxelizer.association).
         self._pairs: dict[tuple[int, int, int, int], _PairState] = {}
         self._frame = 0
+        # association: gap keeps its own state (smoothed gaps per camera-slot pair)
+        self.gap: GapAssociation | None = None
+        if self.voxelizer.gap_settings is not None:
+            try:
+                capacities = dict(tracked_prompt_capacities(config))
+            except (AttributeError, KeyError, ValueError):
+                capacities = {}                      # no prompts configured: no count to hold
+            self.gap = GapAssociation(self.voxelizer.gap_settings, self.voxelizer.voxel_size_m, capacities)
+        self._last_stamp_ns = 0
 
     def _pair_passes(self, key: tuple[int, int, int, int], passed: bool, label: str, score: float) -> bool:
         """Update the hysteresis state of one cross-view pair; return whether it counts as merged."""
@@ -474,6 +487,20 @@ class CrossViewAligner:
                 logger.info("cross-view split: %s view%d[slot %d] | view%d[slot %d] (containment %.2f)",
                             label, key[0], key[1], key[2], key[3], score)
         return state.merged
+
+    def _gap_edges(self, observations: list[_VoxelObservation], results: list[FrameResult], counters: dict[str, int]):
+        """association: gap. -> edges (-gap, index a, index b): the union below takes the smallest gap first."""
+        stamp_ns = max((int(getattr(result.frame, "timestamp_ns", 0) or 0) for result in results), default=0)
+        dt_s = (stamp_ns - self._last_stamp_ns) * 1.0e-9 if stamp_ns and self._last_stamp_ns else 0.0
+        self._last_stamp_ns = stamp_ns
+        if not 0.0 < dt_s < 1.0:
+            dt_s = 1.0 / 30.0
+        edges = self.gap.associate(observations, dt_s)
+        counters["num_cross_view_candidate_pairs"] += self.gap.candidate_pairs
+        counters["num_cross_view_gap_measurements"] = self.gap.measured_pairs
+        counters["num_cross_view_forced_merges"] = self.gap.forced_merges
+        counters["num_cross_view_over_capacity"] = self.gap.over_capacity
+        return [(-gap, index_a, index_b) for gap, index_a, index_b in edges]
 
     def _prune_pairs(self) -> None:
         if self._frame % 300 == 0:
@@ -539,7 +566,12 @@ class CrossViewAligner:
         voxel_match_ms = 0.0
         hungarian_ms = 0.0
 
-        for view_a, view_b in combinations(sorted(by_view), 2):
+        if self.gap is not None:
+            edges = self._gap_edges(observations, results, counters)
+            view_pairs = ()
+        else:
+            view_pairs = combinations(sorted(by_view), 2)
+        for view_a, view_b in view_pairs:
             indices_a = by_view[view_a]
             indices_b = by_view[view_b]
             labels = sorted(
@@ -1407,10 +1439,21 @@ class _Track:
 class CrossFrameAligner:
     """Persistent global ids by AABB containment between consecutive observations.
 
-    No motion model: a track is its last observed world AABB. Oldest track first, every track
-    takes the unmatched same-class observation with the highest affinity, where the affinity is
+    No motion model: a track is its last observed world AABB. A track and an observation of its
+    class can be matched when their affinity reaches ``min_containment_ratio``; the affinity is
     the AABB containment ratio (intersection volume over the smaller box) and reaches 1.0 when
-    one box contains the other's centre (expanded by ``centre_margin_m``). At 30 fps a walking
+    one box contains the other's centre (expanded by ``centre_margin_m``). Who is matched with
+    whom (``assignment``):
+      oldest_first  oldest track first, every track takes the free observation with the highest
+                    affinity. Objects of a class closer than ``centre_margin_m`` all have affinity
+                    1.0 for each other and exchange their ids at random.
+      nearest       as many matches as possible, with the least total distance between the box
+                    centres (Hungarian); of two tracks at the same distance the older one wins.
+                    ``centre_margin_m`` is then the margin after one nominal frame and grows with
+                    the time since the track was seen (a speed limit of centre_margin_m /
+                    nominal_dt_s, 4.5 m/s): a lower frame rate or an object hidden for a moment
+                    does not cost the id.
+    At 30 fps a walking
     person moves ~5 cm per frame, far less than a body box, so consecutive boxes overlap; a
     mask that suddenly grows or shrinks keeps the smaller box inside the larger one. Unmatched
     tracks keep their id for ``max_age_s`` (a missed detection or a brief occlusion), unmatched
@@ -1426,6 +1469,9 @@ class CrossFrameAligner:
                                                    config.get("shared_voxel_grid", {}).get("min_containment_ratio", 0.5)))
         self.centre_margin_m = float(cfg.get("centre_margin_m", 0.15))
         self.max_age_s = float(cfg.get("max_age_s", 0.5))
+        self.assignment = str(cfg.get("assignment", "oldest_first"))
+        if self.assignment not in ("oldest_first", "nearest"):
+            raise ValueError("cross_frame_alignment.assignment must be 'oldest_first' or 'nearest'")
         self.nominal_dt_s = float(cfg.get("nominal_dt_s", 1.0 / 30.0))
         device = str(config.runtime.get("device", "cuda"))
         workspace_mb = float(cfg.get("chamfer_max_workspace_mb", 256.0))
@@ -1471,6 +1517,8 @@ class CrossFrameAligner:
         the other's centre (expanded by centre_margin_m)."""
         ratio = self._containment(track.bbox_min, track.bbox_max, lo_o, hi_o)
         g = self.centre_margin_m
+        if self.assignment == "nearest":           # the margin is a speed: it grows with the time since the track was seen
+            g *= max(1.0, (self._time_s - track.last_seen_s) / self.nominal_dt_s)
         centre_t = 0.5 * (track.bbox_min + track.bbox_max)
         centre_o = 0.5 * (lo_o + hi_o)
         if np.all(centre_t >= lo_o - g) and np.all(centre_t <= hi_o + g):
@@ -1478,6 +1526,31 @@ class CrossFrameAligner:
         if np.all(centre_o >= track.bbox_min - g) and np.all(centre_o <= track.bbox_max + g):
             return 1.0
         return ratio
+
+    def _nearest_matches(self, by_age: list[_Track], current: list[MultiViewInstance], boxes, counters):
+        """assignment: nearest. -> (track, index into current) of every match."""
+        matches = []
+        for label in {track.label for track in by_age}:
+            tracks = [track for track in by_age if track.label == label]
+            indices = [i for i, item in enumerate(current) if boxes[i] is not None and item.semantic_label == label]
+            if not indices:
+                continue
+            counters["num_cross_frame_candidate_pairs"] += len(tracks) * len(indices)
+            # a possible match is worth more than any distance: as many matches as possible, then the nearest
+            worth = np.zeros((len(tracks), len(indices)))
+            for row, track in enumerate(tracks):
+                centre = 0.5 * (track.bbox_min + track.bbox_max)
+                for col, i in enumerate(indices):
+                    if self._affinity(track, *boxes[i]) >= self.min_containment_ratio:
+                        distance = float(np.linalg.norm(centre - 0.5 * (boxes[i][0] + boxes[i][1])))
+                        worth[row, col] = distance + 1.0e-6 * row - 1.0e3
+            if len(tracks) == 1 or len(indices) == 1:
+                row, col = np.unravel_index(int(np.argmin(worth)), worth.shape)
+                pairs = [(int(row), int(col))]
+            else:
+                pairs = zip(*linear_sum_assignment(worth))
+            matches.extend((tracks[row], indices[col]) for row, col in pairs if worth[row, col] < 0.0)
+        return matches
 
     def _assign_new_id(self, instance: MultiViewInstance, box=None) -> None:
         instance.global_track_id = self.next_global_track_id
@@ -1580,8 +1653,16 @@ class CrossFrameAligner:
                 logger.warning("cross-frame: fused instance without AABB/centroid; it gets a fresh id every frame")
             free = set(range(len(current)))
             matched_tracks: set[int] = set()
+            by_age = sorted(self.tracks.values(), key=lambda t: (t.created, t.track_id))
+            if self.assignment == "nearest":
+                for track, index in self._nearest_matches(by_age, current, boxes, counters):
+                    free.discard(index)
+                    matched_tracks.add(track.track_id)
+                    self._update_track(track, current[index], boxes[index])
+                    counters["num_cross_frame_matches"] += 1
+                by_age = []
             # Oldest track first ("oldest id wins" when two groups merge into one observation).
-            for track in sorted(self.tracks.values(), key=lambda t: (t.created, t.track_id)):
+            for track in by_age:
                 best, best_a = None, self.min_containment_ratio
                 for i in free:
                     if boxes[i] is None or current[i].semantic_label != track.label:
