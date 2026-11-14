@@ -294,7 +294,11 @@ Known limits: two objects of a class that touch and are each seen by another cam
 
 ### Cross-frame
 
-A track is its last observed world box; there is no motion model. A track and an observation of its class can be matched when the containment of their boxes (intersection volume over the smaller box) reaches `min_containment_ratio` or one box holds the other's centre, expanded by a margin. The margin is `centre_margin_m` after one frame at 30 Hz and grows with the time since the track was seen (a speed limit of `centre_margin_m / nominal_dt_s`, 4.5 m/s), so a lower frame rate or a short occlusion does not cost the id. Among the possible matches the aligner takes as many as possible with the least total distance between the box centres (Hungarian); of two tracks at the same distance the older one wins, so the survivor keeps the oldest id when two groups merge, and objects of a class next to each other keep their ids. Unmatched tracks keep their id for `max_age_s`; unmatched observations start a new track. An object that reappears farther away than the margin allows gets a new id.
+A track is its last observed world box; there is no motion model. Tracks and observations of a class are matched with the least total distance between their box centres (Hungarian); of two tracks at the same distance the older one wins, so the survivor keeps the oldest id when two groups merge, and objects of a class next to each other keep their ids.
+
+A match needs one box to hold the other's centre, expanded by a margin. Without this gate the id of an object that disappears would pass to another object that appears in the same frame, and the scene flow would be given two unrelated clouds under one id. The test scales with the object: a mask that suddenly swallows a chair moves the box centre by half a metre, but the old centre is still inside the new box. The margin is `centre_margin_m` after one frame at 30 Hz and grows with the time since the track was seen (a speed limit of `centre_margin_m / nominal_dt_s`, 4.5 m/s), so a lower frame rate or a short occlusion does not cost the id. Unmatched tracks keep their id for `max_age_s`; unmatched observations start a new track. An object that reappears farther away than the margin allows gets a new id.
+
+Gates that were tried on the benchmark scenes (id changes at 30 / 15 Hz; this gate: 2 / 6): box overlap of at least half of the smaller box 406 / 685, intersection over union of at least 0.3: 442 / 668 (a small fast object does not overlap its box of the frame before), no gate 0 / 4 but two ids passed to another object 0.75 m away.
 
 ### Cloud bank
 
@@ -507,7 +511,6 @@ shared_voxel_grid:
   gap: {merge_m: 0.15, split_m: 0.20, forced_max_m: 0.50}
 
 cross_frame_alignment:
-  min_containment_ratio: 0.5
   centre_margin_m: 0.15
   max_age_s: 0.5
   bank_preallocate_points: 8192

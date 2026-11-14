@@ -803,15 +803,17 @@ class _Track:
 class CrossFrameAligner:
     """Persistent global ids by the nearest world box.
 
-    A track is its last observed world AABB; there is no motion model. A track and an observation of
-    its class can be matched when the containment of the boxes (intersection volume over the smaller
-    box) reaches ``min_containment_ratio`` or one box holds the other's centre, expanded by a margin.
-    The margin is ``centre_margin_m`` after one nominal frame and grows with the time since the track
-    was seen (a speed limit of centre_margin_m / nominal_dt_s, 4.5 m/s), so a lower frame rate or an
-    object hidden for a moment does not cost the id. Among the possible matches: as many as possible,
-    with the least total distance between the box centres (Hungarian); of two tracks at the same
-    distance the older one wins, so the survivor keeps the oldest id when two groups merge. Unmatched
-    tracks keep their id for ``max_age_s``, unmatched observations start a new track.
+    A track is its last observed world AABB; there is no motion model. Tracks and observations of a
+    class are matched with the least total distance between their box centres (Hungarian); of two
+    tracks at the same distance the older one wins, so the survivor keeps the oldest id when two
+    groups merge. A match needs one box to hold the other's centre, expanded by a margin: without
+    that gate the id of an object that disappears would pass to another that appears in the same
+    frame, and the scene flow would pair two unrelated clouds. The test scales with the object (a
+    mask that suddenly swallows a chair moves the centre by half a metre; the old centre is still in
+    the new box). The margin is ``centre_margin_m`` after one nominal frame and grows with the time
+    since the track was seen (a speed limit of centre_margin_m / nominal_dt_s, 4.5 m/s), so a lower
+    frame rate or an object hidden for a moment does not cost the id. Unmatched tracks keep their
+    id for ``max_age_s``, unmatched observations start a new track.
 
     The CUDA bank of fused clouds is filled here (``_stage_current_bank``): the ScenePredictor adapter
     consumes its views.
@@ -822,7 +824,6 @@ class CrossFrameAligner:
         assignment = str(cfg.get("assignment", "nearest"))
         if assignment != "nearest":
             raise ValueError(f"cross_frame_alignment.assignment {assignment!r} was removed; the only assignment is 'nearest'")
-        self.min_containment_ratio = float(cfg.get("min_containment_ratio", 0.5))
         self.centre_margin_m = float(cfg.get("centre_margin_m", 0.15))
         self.max_age_s = float(cfg.get("max_age_s", 0.5))
         self.nominal_dt_s = float(cfg.get("nominal_dt_s", 1.0 / 30.0))
@@ -846,28 +847,16 @@ class CrossFrameAligner:
             return c.copy(), c.copy()
         return None
 
-    @staticmethod
-    def _containment(lo_a, hi_a, lo_b, hi_b) -> float:
-        """Intersection volume over the smaller box volume for two world AABBs (metres)."""
-        inter = np.prod(np.maximum(np.minimum(hi_a, hi_b) - np.maximum(lo_a, lo_b), 0.0))
-        if inter <= 0.0:
-            return 0.0
-        vol = min(np.prod(np.maximum(hi_a - lo_a, 1e-6)), np.prod(np.maximum(hi_b - lo_b, 1e-6)))
-        return float(inter / vol)
-
-    def _affinity(self, track: _Track, lo_o: np.ndarray, hi_o: np.ndarray) -> float:
-        """Containment of the track's last box with the observation; 1.0 when one box contains
-        the other's centre (expanded by the margin)."""
-        ratio = self._containment(track.bbox_min, track.bbox_max, lo_o, hi_o)
+    def _admissible(self, track: _Track, lo_o: np.ndarray, hi_o: np.ndarray) -> bool:
+        """One of the two boxes holds the other's centre, expanded by the margin."""
         # the margin is a speed: it grows with the time since the track was seen
         g = self.centre_margin_m * max(1.0, (self._time_s - track.last_seen_s) / self.nominal_dt_s)
         centre_t = 0.5 * (track.bbox_min + track.bbox_max)
         centre_o = 0.5 * (lo_o + hi_o)
-        if np.all(centre_t >= lo_o - g) and np.all(centre_t <= hi_o + g):
-            return 1.0
-        if np.all(centre_o >= track.bbox_min - g) and np.all(centre_o <= track.bbox_max + g):
-            return 1.0
-        return ratio
+        return bool(
+            (np.all(centre_t >= lo_o - g) and np.all(centre_t <= hi_o + g))
+            or (np.all(centre_o >= track.bbox_min - g) and np.all(centre_o <= track.bbox_max + g))
+        )
 
     def _matches(self, by_age: list[_Track], current: list[MultiViewInstance], boxes, counters):
         """-> (track, index into current) of every match."""
@@ -883,7 +872,7 @@ class CrossFrameAligner:
             for row, track in enumerate(tracks):
                 centre = 0.5 * (track.bbox_min + track.bbox_max)
                 for col, i in enumerate(indices):
-                    if self._affinity(track, *boxes[i]) >= self.min_containment_ratio:
+                    if self._admissible(track, *boxes[i]):
                         distance = float(np.linalg.norm(centre - 0.5 * (boxes[i][0] + boxes[i][1])))
                         worth[row, col] = distance + 1.0e-6 * row - 1.0e3
             if len(tracks) == 1 or len(indices) == 1:
@@ -1006,9 +995,11 @@ class CrossFrameAligner:
                 if boxes[i] is not None and logger.isEnabledFor(logging.INFO):
                     same = [t for t in self.tracks.values() if t.label == current[i].semantic_label and t.track_id not in matched_tracks]
                     if same:
-                        near = max(same, key=lambda t: self._affinity(t, *boxes[i]))
+                        here = 0.5 * (boxes[i][0] + boxes[i][1])
+                        apart = lambda t: float(np.linalg.norm(here - 0.5 * (t.bbox_min + t.bbox_max)))
+                        near = min(same, key=apart)
                         size = np.round(boxes[i][1] - boxes[i][0], 2).tolist()
-                        why = (f"; best unmatched id {near.track_id}: affinity {self._affinity(near, *boxes[i]):.2f} < {self.min_containment_ratio:g}, "
+                        why = (f"; nearest unmatched id {near.track_id}: centres {apart(near):.2f} m apart, outside each other's box, "
                                f"unseen {self._time_s - near.last_seen_s:.2f} s, obs box size {size}, dt {dt * 1e3:.0f} ms")
                 self._assign_new_id(current[i], boxes[i])
                 counters["num_cross_frame_new_ids"] += 1

@@ -50,7 +50,7 @@ def tracker_config(capacities: dict[str, int], cameras: int, gap: dict | None = 
         "detector": {"prompts": [[label, count] for label, count in capacities.items()]},
         "postprocess": {"gpu_geometry": True, "gpu_alignment": gpu},
         "shared_voxel_grid": grid,
-        "cross_frame_alignment": {"min_containment_ratio": 0.5, "centre_margin_m": 0.15, "max_age_s": 0.5, "bank_preallocate_points": 16384},
+        "cross_frame_alignment": {"centre_margin_m": 0.15, "max_age_s": 0.5, "bank_preallocate_points": 16384},
     })
 
 

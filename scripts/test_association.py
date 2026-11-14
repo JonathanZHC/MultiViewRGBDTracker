@@ -226,6 +226,26 @@ def test_the_margin_grows_with_the_time_since_the_track_was_seen():
     assert again[0].global_track_id == first[0].global_track_id
 
 
+def test_an_id_does_not_pass_to_another_object_that_appears_as_one_disappears():
+    aligner = _frame_aligner()
+    first = _fused([[0.0, 0.0, 0.8]])
+    aligner.align(first, stamp_ns=1)
+    other = _fused([[0.75, 0.0, 0.8]])                           # the first one is gone, another shows up 0.75 m away
+    aligner.align(other, stamp_ns=1 + 33_333_333)
+    assert other[0].global_track_id != first[0].global_track_id
+
+
+def test_a_box_that_suddenly_grows_keeps_its_id():
+    aligner = _frame_aligner()
+    person = [MultiViewInstance(group_id=1, semantic_label="can", members=[], points_world=None, colors_rgb=np.empty((0, 3), np.uint8),
+                                centroid_world=None, bbox_min=np.float32([0.0, 0.0, 0.0]), bbox_max=np.float32([0.5, 0.3, 1.7]))]
+    aligner.align(person, stamp_ns=1)
+    grown = [MultiViewInstance(group_id=1, semantic_label="can", members=[], points_world=None, colors_rgb=np.empty((0, 3), np.uint8),
+                               centroid_world=None, bbox_min=np.float32([0.0, 0.0, 0.0]), bbox_max=np.float32([2.6, 0.5, 1.7]))]
+    aligner.align(grown, stamp_ns=1 + 33_333_333)                # the mask swallowed the background: the centre moved 1 m
+    assert grown[0].global_track_id == person[0].global_track_id
+
+
 def test_the_older_track_keeps_its_id_when_two_instances_become_one():
     aligner = _frame_aligner()
     aligner.align(_fused([[0.0, 0.0, 0.8]]), stamp_ns=1)
