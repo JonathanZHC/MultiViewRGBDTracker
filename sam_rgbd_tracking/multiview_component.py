@@ -128,6 +128,7 @@ class MultiViewEfficientTAMComponent:
                 cy=float(item["cy"]),
                 timestamp_ns=int(item.get("timestamp_ns", 0)),
                 world_from_camera=item.get("world_from_camera"),
+                depth_gpu=item.get("depth_gpu"),
             )
             for view, item in zip(self.views, view_inputs)
         ]

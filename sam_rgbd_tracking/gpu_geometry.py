@@ -1136,15 +1136,21 @@ class GPUSparseGeometryBackend:
             raise ValueError("Depth prefetch requires equal depth image shapes")
         self._ensure_depth_buffers(len(frames), h, w)
         started = perf_counter()
-        host = self._direct_host_depths[: len(frames)].numpy()
-        for view_index, frame in enumerate(frames):
-            np.copyto(host[view_index], np.asarray(frame.depth_m, dtype=np.float32))
+        on_device = all(getattr(frame, "depth_gpu", None) is not None for frame in frames)
+        if not on_device:
+            host = self._direct_host_depths[: len(frames)].numpy()
+            for view_index, frame in enumerate(frames):
+                np.copyto(host[view_index], np.asarray(frame.depth_m, dtype=np.float32))
         cpu_pack_ms = (perf_counter() - started) * 1000.0
         with torch.cuda.stream(self._depth_stream):
             self._depth_profile_start.record(self._depth_stream)
-            self._direct_depths[: len(frames)].copy_(
-                self._direct_host_depths[: len(frames)], non_blocking=True
-            )
+            if on_device:                             # the caller holds the depth on the device: no host pack, no upload
+                for view_index, frame in enumerate(frames):
+                    self._direct_depths[view_index].copy_(frame.depth_gpu, non_blocking=True)
+            else:
+                self._direct_depths[: len(frames)].copy_(
+                    self._direct_host_depths[: len(frames)], non_blocking=True
+                )
             self._depth_profile_end.record(self._depth_stream)
             self._depth_ready_event.record(self._depth_stream)
         self._prefetched_depth_key = self._depth_frame_key(frames)
@@ -1327,6 +1333,9 @@ class GPUSparseGeometryBackend:
             direct_cpu_t0 = now
 
         prefetched = bool(use_prefetched_depth and self._consume_prefetched_depth(frames))
+        if not prefetched and all(getattr(frame, "depth_gpu", None) is not None for frame in frames):
+            self.prefetch_depth(frames)               # device-to-device copy instead of the host pack below
+            prefetched = self._consume_prefetched_depth(frames)
         intr_host = self._direct_host_intrinsics[: len(frames)].numpy()
         if not prefetched:
             depth_host = self._direct_host_depths[: len(frames)].numpy()

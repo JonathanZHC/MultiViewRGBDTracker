@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import copy
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -75,6 +76,7 @@ class SAMTrackingComponent:
         cy: float,
         timestamp_ns: int = 0,
         world_from_camera: np.ndarray | None = None,
+        depth_gpu: Any = None,
     ) -> RGBDFrame:
         h, w = depth_m.shape
         frame = RGBDFrame(
@@ -82,13 +84,18 @@ class SAMTrackingComponent:
             frame_index=self.frame_index,
             timestamp_ns=int(timestamp_ns),
             rgb=np.ascontiguousarray(rgb, dtype=np.uint8),
-            depth_m=np.ascontiguousarray(depth_m, dtype=np.float32),
+            depth_m=(
+                depth_m                                  # lazy host view of depth_gpu: do not download it here
+                if getattr(depth_m, "lazy_host", False)
+                else np.ascontiguousarray(depth_m, dtype=np.float32)
+            ),
             intrinsics=CameraIntrinsics(float(fx), float(fy), float(cx), float(cy), w, h),
             world_from_camera=(
                 None
                 if world_from_camera is None
                 else np.asarray(world_from_camera, dtype=np.float32)
             ),
+            depth_gpu=depth_gpu,
         )
         self.frame_index += 1
         return frame

@@ -26,6 +26,10 @@ class RGBDFrame:
     depth_m: np.ndarray
     intrinsics: CameraIntrinsics
     world_from_camera: np.ndarray | None = None
+    # Optional: the same depth as a CUDA tensor [H, W] float32, when the caller already holds it on the
+    # device. The GPU geometry then copies device to device instead of packing and uploading `depth_m`,
+    # and `depth_m` may be a lazy host view of this tensor (array-like, downloads when its pixels are read).
+    depth_gpu: "object | None" = None
 
 
 @dataclass
